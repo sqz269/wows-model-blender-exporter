@@ -1,0 +1,81 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wows-model-blender-exporter"
+version = "0.1.0a1"
+description = "Blender consumer for the wows-model-export pipeline (DDS→PNG publisher + Blender add-on for ship import)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Zong" }]
+keywords = [
+    "world-of-warships",
+    "wows",
+    "blender",
+    "asset-pipeline",
+    "gltf",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Graphics :: 3D Modeling",
+]
+
+# Two hard deps:
+#  * wows-model-export → reuses compose.publish for the copy phase,
+#    PipelineConfig for path resolution, and read.sidecar / read.library_index.
+#  * Pillow → DDS decode for the publisher's PNG conversion pass.
+# Blender's own bundled Python ships neither, so the add-on side does
+# NOT import either of these (see src/wows_blender/ — pure stdlib).
+dependencies = [
+    "wows-model-export>=0.1.0a1",
+    "pillow>=10.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff>=0.4",
+    "mypy>=1.8",
+]
+
+[project.scripts]
+wows-export-blender = "wows_model_blender_exporter.cli.export_blender:main"
+wows-pack-blender-addon = "wows_model_blender_exporter.cli.pack_addon:main"
+
+# Webview consumer plugin. Discovered at runtime by the wows-model-export
+# webview server via importlib.metadata.entry_points; renders a "Blender"
+# card under the Consumers tab. The producer carries zero hardcoded
+# references to this package — discovery is fully name-agnostic.
+[project.entry-points."wows_model_export.consumers"]
+blender = "wows_model_blender_exporter.consumer:descriptor"
+
+[project.urls]
+Homepage = "https://github.com/sqz269/wows-model-blender-exporter"
+Repository = "https://github.com/sqz269/wows-model-blender-exporter"
+"Pipeline (producer)" = "https://github.com/sqz269/wows-model-export"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+# Only the Python publisher package is shipped via pip; the Blender
+# add-on (src/wows_blender/) is packaged separately into a ZIP via
+# `wows-pack-blender-addon`. Including it in the wheel would pull
+# `bpy` import-time errors when other tooling imports the publisher.
+include = ["wows_model_blender_exporter*"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+ignore = [
+    "E501",
+]

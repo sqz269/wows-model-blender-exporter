@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.venv/
+venv/
+env/
+.coverage
+htmlcov/
+
+# Editor / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local config
+.env
+.env.local
+
+# Blender add-on build artifacts
+wows_blender-*.zip
+
+# Scratch / ad-hoc work
+scratch/
+tmp/
+*.tmp
+
+# Claude Code project state
+.claude/
