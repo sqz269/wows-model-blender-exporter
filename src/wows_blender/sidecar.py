@@ -51,6 +51,8 @@ class MaterialEntry:
     texture_sets:   dict[str, dict[str, TextureRef]] = field(default_factory=dict)
     factors:        dict[str, Any] = field(default_factory=dict)
     uv_channels:    dict[str, int] = field(default_factory=dict)
+    detail_params:  dict[str, Any] = field(default_factory=dict)
+    emission_anim:  dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -139,6 +141,8 @@ def _coerce_material(raw: dict[str, Any]) -> MaterialEntry:
         texture_sets=texture_sets,
         factors=dict(raw.get("factors") or {}),
         uv_channels=dict(raw.get("uv_channels") or {}),
+        detail_params=dict(raw.get("detail_params") or {}),
+        emission_anim=dict(raw.get("emission_anim") or {}),
     )
 
 
