@@ -397,7 +397,11 @@ def write_material_manifest(path: Path, *, fbx_name: str, axis_up: str, axis_for
             "double_sided":     not mat.use_backface_culling,
             "slots":            slots,
         }
-        for key in ("wows_camo_path", "wows_camo_category", "wows_camo_skin", "wows_fbx_baked"):
+        for key in (
+            "wows_camo_path", "wows_camo_category", "wows_camo_skin",
+            "wows_fbx_baked", "wows_roughness", "wows_metallic",
+            "wows_emissive_strength",
+        ):
             if key in mat:
                 entry[key.removeprefix("wows_")] = mat[key]
         materials.append(entry)

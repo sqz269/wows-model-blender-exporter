@@ -1,0 +1,185 @@
+"""Static-bake + material-dedup + join for draw-call-bound consumers.
+
+A fully-assembled battleship is ~615 mesh objects with ~570 material
+instances. That's fine for Blender and modern engines; it's hostile to a
+consumer with no batching (Koikatsu is Unity 5.6 — one-plus draw call
+per renderer, per pass). Measured on AL Massachusetts, the 571 materials
+collapse to 94 unique (material class, texture set) pairs, so combining
+gets ~6.5x fewer renderers with zero visual change.
+
+Three steps, all destructive (run on a throwaway scene right before FBX
+export — after camo application, before ``fbx_prep``):
+
+1. **Bake to world**: every mesh is evaluated through the depsgraph
+   (applies armature deform at rest — safe because WG bind pose equals
+   rest pose, verified empirically: disabling all armature modifiers on
+   Massachusetts changes nothing) and transformed into world space. The
+   same move the prop pipeline uses (`export_prop_fbx.py`), for the same
+   reason: parented/skinned transform chains through FBX are fragile.
+2. **Dedup materials**: canonical key = (name stripped of Blender's
+   ``.NNN`` suffix, the set of images bound to its WoWS slots). Two
+   turrets' materials merge; two parts of the same WG class with
+   different textures stay separate.
+3. **Join by material**: single-material meshes sharing a canonical
+   material become one object named after it. Groups exceeding Unity
+   5.6's 65k-vertex ceiling are left as multiple objects (a join would
+   only be auto-split at import anyway, and the split children lose
+   their name).
+"""
+from __future__ import annotations
+
+import logging
+import re
+from dataclasses import dataclass, field
+
+import bpy
+import mathutils
+
+logger = logging.getLogger(__name__)
+
+#: Unity 5.6 mesh import ceiling (16-bit index buffers).
+_VERT_LIMIT = 65_000
+
+_SUFFIX_RE = re.compile(r"\.\d+$")
+
+#: Image-bearing node names that define a material's identity.
+_SLOT_NODES = (
+    "WoWS_baseColor", "WoWS_camo_matAlbedo", "WoWS_baseColor_baked",
+    "WoWS_metallicRoughness", "WoWS_normal", "WoWS_occlusion",
+    "WoWS_emissive",
+)
+
+
+@dataclass
+class CombineStats:
+    meshes_in:     int = 0
+    meshes_out:    int = 0
+    materials_in:  int = 0
+    materials_out: int = 0
+    baked:         int = 0
+    over_limit_groups: int = 0
+    notes: list[str] = field(default_factory=list)
+
+    def summary(self) -> str:
+        return (f"meshes {self.meshes_in}->{self.meshes_out}  "
+                f"materials {self.materials_in}->{self.materials_out}"
+                + (f"  ({self.over_limit_groups} groups kept split for 65k)"
+                   if self.over_limit_groups else ""))
+
+
+def _material_key(mat: bpy.types.Material) -> tuple:
+    """Identity of a material: stripped name + bound slot images."""
+    name = _SUFFIX_RE.sub("", mat.name)
+    slots = []
+    if mat.use_nodes:
+        for node_name in _SLOT_NODES:
+            node = mat.node_tree.nodes.get(node_name)
+            img = getattr(node, "image", None) if node else None
+            if img is not None:
+                slots.append((node_name, img.filepath or img.name))
+    return (name, tuple(sorted(slots)))
+
+
+def _bake_to_world(obj: bpy.types.Object, depsgraph) -> None:
+    """Replace the object's mesh with its evaluated, world-space bake."""
+    mesh = bpy.data.meshes.new_from_object(
+        obj.evaluated_get(depsgraph), depsgraph=depsgraph,
+    )
+    mesh.transform(obj.matrix_world)
+    old = obj.data
+    obj.modifiers.clear()
+    obj.parent = None
+    obj.matrix_parent_inverse = mathutils.Matrix.Identity(4)
+    obj.matrix_world = mathutils.Matrix.Identity(4)
+    obj.data = mesh
+    if old.users == 0:
+        bpy.data.meshes.remove(old)
+
+
+def combine_for_export(stats: CombineStats | None = None) -> CombineStats:
+    """Run the bake + dedup + join over the whole scene."""
+    stats = stats or CombineStats()
+
+    meshes = [o for o in bpy.context.scene.objects if o.type == "MESH"]
+    stats.meshes_in = len(meshes)
+
+    # ---- 1. bake ------------------------------------------------------
+    depsgraph = bpy.context.evaluated_depsgraph_get()
+    for obj in meshes:
+        _bake_to_world(obj, depsgraph)
+        stats.baked += 1
+
+    # Armatures and the (now transform-free) empty scaffolding are dead
+    # weight for a static export.
+    for obj in [o for o in list(bpy.data.objects) if o.type == "ARMATURE"]:
+        bpy.data.objects.remove(obj, do_unlink=True)
+    for obj in [o for o in list(bpy.data.objects) if o.type == "EMPTY"]:
+        bpy.data.objects.remove(obj, do_unlink=True)
+
+    # ---- 2. dedup materials ------------------------------------------
+    canonical: dict[tuple, bpy.types.Material] = {}
+    seen_mats: set[str] = set()
+    for obj in [o for o in bpy.context.scene.objects if o.type == "MESH"]:
+        for slot in obj.material_slots:
+            mat = slot.material
+            if mat is None:
+                continue
+            seen_mats.add(mat.name)
+            key = _material_key(mat)
+            keep = canonical.setdefault(key, mat)
+            if keep is not mat:
+                slot.material = keep
+    stats.materials_in = len(seen_mats)
+    stats.materials_out = len(canonical)
+
+    # ---- 3. join by material -----------------------------------------
+    groups: dict[str, list[bpy.types.Object]] = {}
+    for obj in [o for o in bpy.context.scene.objects if o.type == "MESH"]:
+        mats = [s.material for s in obj.material_slots if s.material]
+        if len(mats) != 1:
+            # Multi-material meshes are foreign to the producer's output;
+            # leave them alone rather than joining across materials.
+            continue
+        groups.setdefault(mats[0].name, []).append(obj)
+
+    out_count = 0
+    for mat_name, objs in groups.items():
+        if len(objs) == 1:
+            out_count += 1
+            continue
+        # Respect the 65k ceiling: greedily bucket members.
+        buckets: list[list[bpy.types.Object]] = []
+        cur: list[bpy.types.Object] = []
+        cur_v = 0
+        for o in sorted(objs, key=lambda o: len(o.data.vertices), reverse=True):
+            v = len(o.data.vertices)
+            if cur and cur_v + v > _VERT_LIMIT:
+                buckets.append(cur)
+                cur, cur_v = [], 0
+            cur.append(o)
+            cur_v += v
+        if cur:
+            buckets.append(cur)
+        if len(buckets) > 1:
+            stats.over_limit_groups += 1
+
+        base = _SUFFIX_RE.sub("", mat_name)
+        for i, bucket in enumerate(buckets):
+            if len(bucket) == 1:
+                out_count += 1
+                continue
+            bpy.ops.object.select_all(action="DESELECT")
+            for o in bucket:
+                o.select_set(True)
+            bpy.context.view_layer.objects.active = bucket[0]
+            bpy.ops.object.join()
+            joined = bpy.context.view_layer.objects.active
+            joined.name = base if i == 0 else f"{base}_{i + 1:02d}"
+            joined.data.name = joined.name
+            out_count += 1
+
+    stats.meshes_out = len([o for o in bpy.context.scene.objects if o.type == "MESH"])
+    return stats
+
+
+__all__ = ["CombineStats", "combine_for_export"]

@@ -490,10 +490,20 @@ def bind_material(
     _apply_factors(mat, bsdf, entry.factors, bound)
     _apply_render_state(mat, bsdf, entry, bound)
 
-    # Stash sidecar metadata for downstream inspection.
+    # Stash sidecar metadata for downstream inspection. The authored
+    # factors ride along because consumers whose shader takes a SCALAR
+    # gloss (rather than the packed _mr map) have no other source for it —
+    # see the FBX material manifest.
     mat["wows_material_id"]   = entry.material_id
     mat["wows_scheme"]        = scheme
     mat["wows_shader_intent"] = entry.shader_intent
+    factors = entry.factors or {}
+    if factors.get("roughness") is not None:
+        mat["wows_roughness"] = float(factors["roughness"])
+    if factors.get("metallic") is not None:
+        mat["wows_metallic"] = float(factors["metallic"])
+    if factors.get("emissive_strength") is not None:
+        mat["wows_emissive_strength"] = float(factors["emissive_strength"])
     return len(bound)
 
 

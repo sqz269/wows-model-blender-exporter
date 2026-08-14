@@ -1,5 +1,14 @@
 """Headless-callable ship construction.
 
+Includes the WG-runtime attachment composition (webview parity): hosts
+whose library entry names an ``attached_accessories.json`` get their
+bundled misc placements (rangefinders, searchlights, ammo boxes...)
+instantiated under the host instance, gated by the per-HP ``misc_filter``
+whitelist. Attachment matrices are host-local and post-multiplied by
+``diag(-1,1,1,1)`` — the producer authors them for an X-negating
+consumer (gltFast); unmirrored importers (three.js, Blender) apply the
+local X-flip explicitly. See ``webview/src/lib/ship/placement.ts``.
+
 The scene-building logic used to live inside
 :class:`~wows_blender.importer.WOWS_OT_import_ship.execute`, which made it
 unreachable from a ``blender --background`` run (an Operator needs a
@@ -13,17 +22,18 @@ The pure-stdlib readers (``sidecar``, ``library_index``, ``placement``,
 """
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 import bpy
 import mathutils
 
 from .camo import resolve_path_a
 from .camo_nodes import apply_path_a, apply_path_b
-from .library_index import LibraryIndex, load_library_index, resolve_asset_glb
+from .library_index import LibraryAsset, LibraryIndex, load_library_index, resolve_asset_glb
 from .materials import DEFAULT_SCHEME, bind_material
 from .placement import gltf_matrix_to_blender_rows, is_finite_matrix
 from .sidecar import MaterialEntry, Placement, Skin, coerce_material, load_ship, load_skins
@@ -58,6 +68,8 @@ class BuildResult:
     ship_name:   str = ""
     placed:      int = 0
     skipped:     int = 0
+    attached:    int = 0
+    attached_filtered: int = 0
     slots_bound: int = 0
     camo_applied: int = 0
     skin_id:     str = DEFAULT_SKIN_ID
@@ -68,6 +80,7 @@ class BuildResult:
     def summary(self) -> str:
         bits = [
             f"{self.ship_name}: hull + {self.placed} placements",
+            f"{self.attached} attached ({self.attached_filtered} misc-dropped)",
             f"skipped {self.skipped}",
             f"{self.slots_bound} texture slots",
         ]
@@ -119,6 +132,56 @@ def _placement_to_matrix(p: Placement) -> mathutils.Matrix | None:
         return None
     rows = gltf_matrix_to_blender_rows(p.matrix)
     return mathutils.Matrix(rows)
+
+
+#: Local X-mirror post-multiplied onto every attachment matrix. The producer
+#: authors attachment transforms for an X-negating importer (gltFast);
+#: unmirrored importers apply this explicitly (webview `applyAttachedMatrix`).
+#: diag(-1,1,1) is axis-aligned, so it commutes with the glTF→Blender axis
+#: rebase and can be applied after conversion.
+_ATTACHED_X_FLIP = mathutils.Matrix.Scale(-1.0, 4, (1.0, 0.0, 0.0))
+
+
+def _attached_to_matrix(matrix16) -> mathutils.Matrix | None:
+    """Translate one attachment's host-local matrix to Blender local."""
+    m = tuple(float(v) for v in matrix16)
+    if not is_finite_matrix(m):
+        return None
+    return mathutils.Matrix(gltf_matrix_to_blender_rows(m)) @ _ATTACHED_X_FLIP
+
+
+def _load_attached_doc(library_root: Path, asset: "LibraryAsset") -> dict[str, Any] | None:
+    """Read a host's ``attached_accessories.json``; None when absent."""
+    rel = asset.attached_accessories
+    if not rel:
+        return None
+    path = library_root / rel
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        logger.warning("attached_accessories unreadable for %s: %s", asset.asset_id, e)
+        return None
+
+
+def _misc_filter_from_sidecar(raw: dict[str, Any]) -> dict[str, list[str] | None]:
+    """Per-instance ``misc_filter`` from the sidecar's typed mount groups.
+
+    The sidecar's Phase-6 autofill is the authoritative source (webview
+    parity — it takes precedence over any value accessories.json carries).
+    Three states matter, so ``None``-vs-``[]`` must be preserved:
+      absent → render every live attachment; ``[]`` → drop all;
+      ``[ids…]`` → whitelist by ``placement_id``.
+    """
+    out: dict[str, list[str] | None] = {}
+    for group in ("turrets", "secondaries", "antiair", "torpedoes", "accessories"):
+        for m in raw.get(group) or []:
+            if not isinstance(m, dict):
+                continue
+            iid = m.get("instance_id")
+            if iid and "misc_filter" in m:
+                mf = m.get("misc_filter")
+                out[str(iid)] = [str(x) for x in mf] if isinstance(mf, list) else None
+    return out
 
 
 def _link_under(parent: bpy.types.Object, children: list[bpy.types.Object]) -> None:
@@ -196,22 +259,86 @@ def _bind_materials(
     return bound, camo
 
 
+def _instantiate_attachments(
+    host_root: bpy.types.Object,
+    host_asset: LibraryAsset,
+    library: LibraryIndex,
+    library_root: Path,
+    misc_filter: list[str] | None,
+) -> tuple[int, int]:
+    """Instantiate a host's bundled attachments under ``host_root``.
+
+    Returns ``(attached, filtered)``. Live list only — the Studio item is
+    the intact ship. ``misc_filter`` semantics (WG runtime, webview
+    parity): ``None`` = keep all, ``[]`` = drop all, else whitelist by
+    ``placement_id``.
+    """
+    doc = _load_attached_doc(library_root, host_asset)
+    att_list = (doc or {}).get("attachments_live") or []
+    if not att_list:
+        return 0, 0
+
+    attached = filtered = 0
+    filter_set = set(misc_filter) if misc_filter else None
+    drop_all = misc_filter is not None and len(misc_filter) == 0
+
+    for att in att_list:
+        pid = str(att.get("placement_id") or "")
+        if drop_all or (filter_set is not None and pid not in filter_set):
+            filtered += 1
+            continue
+        child_id = str(att.get("asset_id") or "")
+        child = library.assets.get(child_id)
+        glb = resolve_asset_glb(library_root, child) if child else None
+        if glb is None:
+            logger.info("attachment %s: asset %r unresolved", pid, child_id)
+            continue
+        matrix16 = (att.get("transform") or {}).get("matrix")
+        if not (isinstance(matrix16, list) and len(matrix16) == 16):
+            continue
+        mat = _attached_to_matrix(matrix16)
+        if mat is None:
+            continue
+
+        roots = _strip_overlay_groups(_import_glb(glb))
+        if not roots:
+            continue
+        child_root = bpy.data.objects.new(f"attached_{child_id}_{pid}", None)
+        child_root.empty_display_type = "ARROWS"
+        child_root.empty_display_size = 0.2
+        bpy.context.scene.collection.objects.link(child_root)
+        child_root.parent = host_root       # host-LOCAL matrix
+        child_root.matrix_local = mat
+        _link_under(child_root, roots)
+
+        child_root["wows_asset_id"] = child_id
+        child_root["wows_attached_placement_id"] = pid
+        child_root["wows_attached_to"] = host_root.name
+        attached += 1
+
+    return attached, filtered
+
+
 def _import_accessory_placements(
     placements: tuple[Placement, ...],
     library: LibraryIndex,
     library_root: Path,
     parent_root: bpy.types.Object,
     *,
+    misc_filters: dict[str, list[str] | None] | None = None,
     role_filter: tuple[str, ...] | None = None,
-) -> tuple[int, int]:
+) -> tuple[int, int, int, int]:
     """Instantiate every placement under ``parent_root``.
 
-    Returns ``(placed, skipped)`` — placed = successfully instantiated,
-    skipped = either the library entry was missing, the GLB was
-    missing from disk, or the matrix was non-finite.
+    Returns ``(placed, skipped, attached, attached_filtered)`` — placed =
+    successfully instantiated, skipped = either the library entry was
+    missing, the GLB was missing from disk, or the matrix was non-finite.
     """
     placed = 0
     skipped = 0
+    attached_total = 0
+    filtered_total = 0
+    misc_filters = misc_filters or {}
     # Group placements by role into a parent Empty per role for
     # outliner sanity — ships have 4 turrets + 80 antiair mounts and
     # interleaving them in a flat hierarchy is unreadable.
@@ -273,7 +400,19 @@ def _import_accessory_placements(
         instance_root["wows_role"]        = p.role
         placed += 1
 
-    return placed, skipped
+        # Bundled attachments — sidecar misc_filter wins over the
+        # accessories.json copy (webview parity: Phase-6 autofill is
+        # authoritative), falling back to the placement's own field.
+        mf = misc_filters.get(p.instance_id)
+        if mf is None and p.instance_id not in misc_filters:
+            mf = list(p.misc_filter) if p.misc_filter is not None else None
+        att, filt = _instantiate_attachments(
+            instance_root, asset, library, library_root, mf,
+        )
+        attached_total += att
+        filtered_total += filt
+
+    return placed, skipped, attached_total, filtered_total
 
 
 def apply_content_filter(
@@ -456,7 +595,7 @@ def build_ship(
     else:
         library_root = publish_root / "accessories"
 
-    placed = skipped = 0
+    placed = skipped = attached = attached_filtered = 0
     if import_accessories and library_root.is_dir():
         index_path = library_root / "index.json"
         if not index_path.is_file():
@@ -467,8 +606,9 @@ def build_ship(
             except Exception as e:  # noqa: BLE001
                 warn(f"library parse failed: {e}")
             else:
-                placed, skipped = _import_accessory_placements(
+                placed, skipped, attached, attached_filtered = _import_accessory_placements(
                     sidecar.placements, library, library_root, root,
+                    misc_filters=_misc_filter_from_sidecar(sidecar.raw),
                 )
                 if bind_materials:
                     # Bind materials on every instantiated accessory.
@@ -521,6 +661,8 @@ def build_ship(
         ship_name=sidecar.ship_name,
         placed=placed,
         skipped=skipped,
+        attached=attached,
+        attached_filtered=attached_filtered,
         slots_bound=bound_count,
         camo_applied=camo_count,
         skin_id=skin.skin_id if skin is not None else DEFAULT_SKIN_ID,

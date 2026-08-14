@@ -26,6 +26,11 @@ class LibraryAsset:
     glb:         str            # path relative to the library root
     textures:    str | None     # PNG mirror dir (legacy producer; may be None)
     textures_dds: str | None    # raw DDS dir (always present for new producer)
+    #: Path (relative to the library root) of this host's
+    #: ``<asset>.attached_accessories.json`` — the WG-runtime-composed misc
+    #: placements bundled with the host (rangefinders, searchlights...).
+    #: Absent for most assets.
+    attached_accessories: str | None = None
     materials:   tuple[dict[str, Any], ...] = ()
     raw:         dict[str, Any] = field(default_factory=dict)
 
@@ -59,6 +64,7 @@ def load_library_index(path: Path) -> LibraryIndex:
             glb=str(entry.get("glb") or ""),
             textures=entry.get("textures"),
             textures_dds=entry.get("textures_dds"),
+            attached_accessories=entry.get("attached_accessories"),
             materials=materials,
             raw=entry,
         )

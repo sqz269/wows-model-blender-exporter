@@ -64,6 +64,11 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="Keep crack / patch damage-state meshes.")
     ap.add_argument("--overlays", action="store_true",
                     help="Keep the Armor / Hitboxes collision volumes.")
+    ap.add_argument("--combine", action="store_true",
+                    help="Static-bake, dedup materials by (class, texture "
+                         "set), and join meshes per material — ~6.5x fewer "
+                         "renderers for draw-call-bound consumers. Flattens "
+                         "the placement hierarchy and drops armatures.")
     ap.add_argument("--bake", action="store_true")
     ap.add_argument("--bake-size", type=int, default=2048)
     ap.add_argument("--axis-up", default="Y")
@@ -160,6 +165,13 @@ def main() -> int:
 
     print(f"built {result.summary()}")
 
+    combine_stats = None
+    if args.combine:
+        from wows_blender.combine import combine_for_export
+
+        combine_stats = combine_for_export()
+        print(f"combine: {combine_stats.summary()}")
+
     counts = PrepCounts()
     if not args.no_materials:
         if args.bake:
@@ -233,6 +245,15 @@ def main() -> int:
         "meshes_filtered": result.meshes_filtered,
         "slots_bound":     result.slots_bound,
         "camo_applied":    result.camo_applied,
+        "combine": (
+            {
+                "meshes_in": combine_stats.meshes_in,
+                "meshes_out": combine_stats.meshes_out,
+                "materials_in": combine_stats.materials_in,
+                "materials_out": combine_stats.materials_out,
+            }
+            if combine_stats is not None else None
+        ),
         "prep": {
             "materials":  counts.materials,
             "base_color": counts.base_color,
