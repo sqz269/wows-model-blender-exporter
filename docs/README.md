@@ -6,6 +6,7 @@ Design notes and reference material for the Blender consumer.
 |---|---|
 | [`coord_conventions.md`](coord_conventions.md) | glTF → Blender axis swap + WG/toolkit basis conjugation. |
 | [`material_binding.md`](material_binding.md) | How sidecar `texture_sets[<scheme>]` maps to Principled BSDF inputs. |
+| [`fbx.md`](fbx.md) | FBX export — why materials need a prep pass, what gets filtered out, and why camo needs `--bake`. |
 
 ## Where the producer schema lives
 

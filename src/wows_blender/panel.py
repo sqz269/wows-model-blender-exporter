@@ -1,12 +1,14 @@
 """N-panel UI under the 3D Viewport "WoWS" tab.
 
-Just the two import operators for now. Future iterations would add:
+Import, skin discovery, and FBX export. Future iterations would add:
 
-* skin scheme switcher (drop-down populated from sidecar.skins)
 * damage state toggle (per-seam patch / crack)
 * per-section visibility toggles
 
-Keeping the panel small while the producer side iterates.
+Skin selection is a free-text ``skin_id`` on the import operator rather
+than a drop-down: populating an enum would mean re-parsing a ~1.4 MB
+sidecar on every UI redraw, so List Skins prints the catalogue to the
+console instead and the id is pasted in.
 """
 from __future__ import annotations
 
@@ -27,6 +29,12 @@ class WOWS_PT_import_panel(Panel):
         col.label(text="Import")
         col.operator("wows.import_ship", icon="MESH_DATA")
         col.operator("wows.import_accessory", icon="MESH_CUBE")
+        col.operator("wows.list_skins", text="List Skins", icon="COLOR")
+
+        layout.separator()
+        col = layout.column(align=True)
+        col.label(text="Export")
+        col.operator("wows.export_fbx", text="Export FBX", icon="EXPORT")
 
         layout.separator()
         col = layout.column(align=True)

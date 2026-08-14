@@ -136,15 +136,54 @@ Every instance root carries custom properties for asset_id, instance_id,
 hp_name, parent_section, and role — pick one in the outliner and the
 Properties panel will show its sidecar identity.
 
+## Camo / permoflage skins
+
+Pass a `skin_id` to paint the ship. Both WG camo paths are implemented:
+Path A (a 4-row palette lerp gated by the `camoExclusionMask`) and
+Path B (a pre-baked per-category albedo atlas). The engine prefers B
+wherever a part carries both, and so does the importer.
+
+```bash
+wows-export-blender BA_Montana --list-skins    # what does this ship offer?
+```
+
+In Blender, set **Skin** on the import operator (or the `--skin` flag
+for FBX). `default` is the bare ship. Transparent materials never take
+paint, and a material with no `camoExclusionMask` is left unpainted
+rather than tinted ungated.
+
+## FBX export
+
+```bash
+wows-export-blender BA_Montana --accessories --fbx
+```
+
+Drives a headless Blender to assemble the ship and write `.fbx` +
+textures + a `<Ship>.materials.json` manifest under `<dest>/fbx/`. There
+is also an **Export FBX** button in the N-panel for a scene you have
+already imported and tweaked.
+
+Two things worth knowing before you use it, both covered in
+[`docs/fbx.md`](docs/fbx.md):
+
+- FBX materials are Phong and cannot express the producer's channel
+  packing, ambient occlusion, or camo masks. The manifest carries what
+  the FBX cannot; bind from it for a faithful PBR result.
+- **Camo needs `--bake`.** A per-pixel palette lerp has no FBX
+  representation, so it has to be flattened into an albedo map.
+
+By default only LOD 0, undamaged, non-collision geometry is exported —
+a hull GLB also carries coarser LOD substitutes, damage-state variants
+and armour volumes, which exported verbatim give you overlapping copies
+of the ship inside a solid shell. `--lod all`, `--damage-variants` and
+`--overlays` opt them back in.
+
 ## What's NOT covered today
 
-- **Camo overlays / skin variants** — only the `main` scheme is bound;
-  per-skin schemes (Azur Lane, Made of Steel, etc.) are in the sidecar
-  but not wired to Blender materials yet. See
-  [`docs/skins.md`](docs/skins.md) for the design sketch.
-- **Damage state cascade** — patches/cracks visibility toggling is
-  implemented in the webview consumer (`damage_cascade.ts`) and Unity
-  (`HullDamageState.cs`); Blender will follow.
+- **Damage state cascade** — the crack / patch meshes are classified and
+  hidden by default (and can be shown), but there is no per-seam state
+  machine like the webview's `damage_cascade.ts` or Unity's
+  `HullDamageState.cs`.
 - **Turret rotation** — accessory armatures are imported but no IK /
   driver bindings; you can rotate the Yaw/Elev bones manually.
 - **Particle FX** — out of scope; the producer's `assets.bin` particle
@@ -161,21 +200,38 @@ wows-model-blender-exporter/
 │   ├── wows_model_blender_exporter/   ← publisher (Pillow-backed)
 │   │   ├── __init__.py
 │   │   ├── dds_to_png.py              ← DDS→PNG conversion pass
+│   │   ├── blender_runner.py          ← find Blender, drive it headlessly
 │   │   └── cli/
 │   │       ├── __init__.py
 │   │       ├── export_blender.py      ← wows-export-blender CLI
 │   │       └── pack_addon.py          ← wows-pack-blender-addon CLI
-│   └── wows_blender/                  ← Blender add-on (stdlib-only)
+│   └── wows_blender/                  ← Blender add-on
 │       ├── __init__.py                ← bl_info + register/unregister
-│       ├── sidecar.py                 ← sidecar v3 reader
+│       │   # pure stdlib — importable outside Blender, unit-testable
+│       ├── sidecar.py                 ← sidecar v3 reader (+ skins)
 │       ├── library_index.py           ← accessory library index reader
 │       ├── placement.py               ← gltf→Blender transform math
-│       ├── materials.py               ← Principled BSDF binder (bpy)
-│       ├── importer.py                ← ship + accessory operators
+│       ├── camo.py                    ← which mask / palette / atlas applies
+│       ├── visibility.py              ← LOD / damage / overlay classification
+│       │   # bpy-dependent — only runs inside Blender
+│       ├── materials.py               ← Principled BSDF binder
+│       ├── camo_nodes.py              ← camo overlay as shader nodes
+│       ├── build.py                   ← ship assembly (headless-callable)
+│       ├── fbx_prep.py                ← FBX-legible rewrite + bake + manifest
+│       ├── headless.py                ← `blender --background` entry point
+│       ├── importer.py                ← operators (import, skins, export FBX)
 │       └── panel.py                   ← N-panel UI
 └── docs/
-    └── README.md                      ← docs index
+    ├── README.md                      ← docs index
+    ├── coord_conventions.md
+    ├── material_binding.md
+    └── fbx.md                         ← FBX export
 ```
+
+The `wows_blender` package is split so the decision-making half
+(`sidecar`, `camo`, `visibility`, `placement`, `library_index`) imports
+without `bpy` and can be exercised from a normal Python interpreter;
+only the half that builds datablocks needs Blender.
 
 ## License
 
