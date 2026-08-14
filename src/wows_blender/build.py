@@ -36,7 +36,17 @@ from .camo_nodes import apply_path_a, apply_path_b
 from .library_index import LibraryAsset, LibraryIndex, load_library_index, resolve_asset_glb
 from .materials import DEFAULT_SCHEME, bind_material
 from .placement import gltf_matrix_to_blender_rows, is_finite_matrix
-from .sidecar import MaterialEntry, Placement, Skin, coerce_material, load_ship, load_skins
+from .sidecar import (
+    Exterior,
+    ExteriorMount,
+    MaterialEntry,
+    Placement,
+    Skin,
+    coerce_material,
+    load_decoratives,
+    load_ship,
+    load_skins,
+)
 from .visibility import HULL_HIDDEN_GROUPS, keeps_mesh, short_mesh_name
 
 logger = logging.getLogger(__name__)
@@ -73,6 +83,10 @@ class BuildResult:
     slots_bound: int = 0
     camo_applied: int = 0
     skin_id:     str = DEFAULT_SKIN_ID
+    exterior_id: str | None = None
+    mounts_swapped:    int = 0
+    decoratives_placed: int = 0
+    base_decoratives_dropped: int = 0
     meshes_kept:     int = 0
     meshes_filtered: int = 0
     warnings:    list[str] = field(default_factory=list)
@@ -84,6 +98,12 @@ class BuildResult:
             f"skipped {self.skipped}",
             f"{self.slots_bound} texture slots",
         ]
+        if self.exterior_id:
+            bits.append(
+                f"exterior {self.exterior_id}: {self.mounts_swapped} mounts "
+                f"swapped, {self.decoratives_placed} decoratives "
+                f"(+{self.base_decoratives_dropped} base dropped)"
+            )
         if self.meshes_filtered:
             bits.append(
                 f"{self.meshes_kept} meshes kept / {self.meshes_filtered} filtered"
@@ -123,15 +143,6 @@ def _strip_overlay_groups(roots: list[bpy.types.Object]) -> list[bpy.types.Objec
         else:
             kept.append(obj)
     return kept
-
-
-def _placement_to_matrix(p: Placement) -> mathutils.Matrix | None:
-    """Translate one sidecar placement to a Blender world matrix."""
-    if not is_finite_matrix(p.matrix):
-        logger.warning("placement %s has non-finite matrix; skipping", p.instance_id)
-        return None
-    rows = gltf_matrix_to_blender_rows(p.matrix)
-    return mathutils.Matrix(rows)
 
 
 #: Local X-mirror post-multiplied onto every attachment matrix. The producer
@@ -319,6 +330,16 @@ def _instantiate_attachments(
     return attached, filtered
 
 
+@dataclass
+class _PlaceStats:
+    placed:   int = 0
+    skipped:  int = 0
+    attached: int = 0
+    attached_filtered: int = 0
+    mounts_swapped:    int = 0
+    skel_ext_dropped:  int = 0
+
+
 def _import_accessory_placements(
     placements: tuple[Placement, ...],
     library: LibraryIndex,
@@ -327,42 +348,82 @@ def _import_accessory_placements(
     *,
     misc_filters: dict[str, list[str] | None] | None = None,
     role_filter: tuple[str, ...] | None = None,
-) -> tuple[int, int, int, int]:
+    mount_swaps: dict[str, ExteriorMount] | None = None,
+    skip_skel_ext: bool = False,
+    on_warning: Callable[[str], None] | None = None,
+) -> _PlaceStats:
     """Instantiate every placement under ``parent_root``.
 
-    Returns ``(placed, skipped, attached, attached_filtered)`` — placed =
-    successfully instantiated, skipped = either the library entry was
-    missing, the GLB was missing from disk, or the matrix was non-finite.
+    ``mount_swaps`` (exterior mode) maps ``hp_name`` → the exterior's
+    variant mount record: the swapped asset replaces the base one, the
+    record's own matrix and TRI-STATE misc_filter apply VERBATIM (Unity
+    ExteriorComposer parity), and an unresolvable variant asset degrades
+    to the base mount — never to a hole in the ship (§12c).
+
+    ``skip_skel_ext`` drops placements with ``source == 'skel_ext_hash'``
+    — the hull-baked decoratives layer a hull-swap exterior replaces
+    wholesale with its own decoratives file.
     """
-    placed = 0
-    skipped = 0
-    attached_total = 0
-    filtered_total = 0
+    stats = _PlaceStats()
     misc_filters = misc_filters or {}
+    mount_swaps = mount_swaps or {}
+    warn = on_warning or (lambda m: logger.warning("%s", m))
     # Group placements by role into a parent Empty per role for
     # outliner sanity — ships have 4 turrets + 80 antiair mounts and
     # interleaving them in a flat hierarchy is unreadable.
     role_parents: dict[str, bpy.types.Object] = {}
+    # hp_name → instance_root, for the rider re-host pass below.
+    instance_by_hp: dict[str, bpy.types.Object] = {}
+    # (rider_root, host_hp, child_node_name) collected during the loop.
+    riders: list[tuple[bpy.types.Object, str, str]] = []
     for p in placements:
         if role_filter is not None and p.role not in role_filter:
             continue
-        asset = library.assets.get(p.asset_id)
+        if skip_skel_ext and p.source == "skel_ext_hash":
+            stats.skel_ext_dropped += 1
+            continue
+
+        # Exterior mount swap: keyed by hardpoint. The swap applies its
+        # own asset / matrix / misc_filter; a missing variant asset falls
+        # back to the base mount below.
+        swap = mount_swaps.get(p.hp_name) if p.hp_name else None
+        asset_id = p.asset_id
+        matrix16 = p.matrix
+        swap_active = False
+        if swap is not None:
+            cand = swap.asset_id or p.asset_id
+            cand_asset = library.assets.get(cand)
+            if cand_asset is not None and resolve_asset_glb(library_root, cand_asset):
+                asset_id = cand
+                if swap.matrix is not None:
+                    matrix16 = swap.matrix
+                swap_active = True
+            else:
+                warn(
+                    f"exterior mount {p.hp_name}: variant asset {cand!r} not in "
+                    f"the accessory library; keeping the base mount "
+                    f"(publish the library — the producer harvests "
+                    f"exteriors[].mounts assets)"
+                )
+
+        asset = library.assets.get(asset_id)
         if asset is None:
-            logger.info("placement %s: asset_id %r missing from library", p.instance_id, p.asset_id)
-            skipped += 1
+            logger.info("placement %s: asset_id %r missing from library", p.instance_id, asset_id)
+            stats.skipped += 1
             continue
         glb = resolve_asset_glb(library_root, asset)
         if glb is None:
             logger.info(
                 "placement %s: asset %s GLB not found at %s",
-                p.instance_id, p.asset_id, library_root / asset.glb,
+                p.instance_id, asset_id, library_root / asset.glb,
             )
-            skipped += 1
+            stats.skipped += 1
             continue
-        mat = _placement_to_matrix(p)
-        if mat is None:
-            skipped += 1
+        if not is_finite_matrix(matrix16):
+            logger.warning("placement %s has non-finite matrix; skipping", p.instance_id)
+            stats.skipped += 1
             continue
+        mat = mathutils.Matrix(gltf_matrix_to_blender_rows(matrix16))
 
         # Group parent (one Empty per role).
         rp_name = _ROLE_GROUP_NAMES.get(p.role, p.role)
@@ -379,10 +440,10 @@ def _import_accessory_placements(
         # so the placement's matrix applies cleanly.
         roots = _strip_overlay_groups(_import_glb(glb))
         if not roots:
-            skipped += 1
+            stats.skipped += 1
             continue
         instance_root = bpy.data.objects.new(
-            f"{p.role}_{p.asset_id}_{p.hp_name or p.instance_id}",
+            f"{p.role}_{asset_id}_{p.hp_name or p.instance_id}",
             None,
         )
         instance_root.empty_display_type = "ARROWS"
@@ -393,26 +454,96 @@ def _import_accessory_placements(
 
         _link_under(instance_root, roots)
 
-        instance_root["wows_asset_id"]    = p.asset_id
+        instance_root["wows_asset_id"]    = asset_id
         instance_root["wows_instance_id"] = p.instance_id
         instance_root["wows_hp_name"]     = p.hp_name or ""
         instance_root["wows_parent_section"] = p.parent_section or ""
         instance_root["wows_role"]        = p.role
-        placed += 1
+        stats.placed += 1
+        if p.hp_name:
+            instance_by_hp[p.hp_name] = instance_root
+        if swap_active:
+            stats.mounts_swapped += 1
+            instance_root["wows_exterior_swap"] = True
+            if swap.attach_to:
+                child = (
+                    p.hp_name[len(swap.attach_to) + 1:]
+                    if p.hp_name and p.hp_name.startswith(swap.attach_to + "_")
+                    else ""
+                )
+                if child:
+                    riders.append((instance_root, swap.attach_to, child))
 
-        # Bundled attachments — sidecar misc_filter wins over the
-        # accessories.json copy (webview parity: Phase-6 autofill is
-        # authoritative), falling back to the placement's own field.
-        mf = misc_filters.get(p.instance_id)
-        if mf is None and p.instance_id not in misc_filters:
-            mf = list(p.misc_filter) if p.misc_filter is not None else None
+        # Bundled attachments. Exterior swaps carry the nodesConfig
+        # misc_filter VERBATIM (None = all, [] = drop all); otherwise the
+        # sidecar's Phase-6 autofill wins over the accessories.json copy
+        # (webview parity), falling back to the placement's own field.
+        if swap_active:
+            mf = list(swap.misc_filter) if swap.misc_filter is not None else None
+        else:
+            mf = misc_filters.get(p.instance_id)
+            if mf is None and p.instance_id not in misc_filters:
+                mf = list(p.misc_filter) if p.misc_filter is not None else None
         att, filt = _instantiate_attachments(
             instance_root, asset, library, library_root, mf,
         )
-        attached_total += att
-        filtered_total += filt
+        stats.attached += att
+        stats.attached_filtered += filt
 
-    return placed, skipped, attached_total, filtered_total
+    # Rider re-host (Unity ExteriorComposer.RehostRider parity): a rider
+    # mount's composite hp names the child node it hangs from inside the
+    # host turret; the variant rider parents to the VARIANT host's
+    # matching node at identity local. No matching node = WG's model-level
+    # way of excluding the rider on this skin → drop it.
+    for rider_root, host_hp, child_name in riders:
+        host = instance_by_hp.get(host_hp)
+        node = _find_shallowest_named(host, child_name) if host else None
+        if node is None:
+            warn(
+                f"exterior rider {rider_root.name}: host {host_hp!r} has no "
+                f"child node {child_name!r}; dropping (visual exclusion)"
+            )
+            for o in [*rider_root.children_recursive, rider_root]:
+                try:
+                    bpy.data.objects.remove(o, do_unlink=True)
+                except (ReferenceError, RuntimeError):
+                    pass
+            stats.placed -= 1
+            continue
+        rider_root.parent = node
+        rider_root.matrix_parent_inverse = mathutils.Matrix.Identity(4)
+        rider_root.matrix_local = mathutils.Matrix.Identity(4)
+
+    return stats
+
+
+def _find_shallowest_named(
+    root: bpy.types.Object | None, name: str,
+) -> bpy.types.Object | None:
+    """Shallowest descendant OBJECT whose pre-dot name matches ``name``.
+
+    Blender suffixes duplicate names (``HP_AGA_4.001``), so match on the
+    stem. Bone-hosted nodes inside an armature are not reachable this way
+    — riders on skinned variant turrets whose mount node imported as a
+    bone are dropped by the caller with a warning (none in the corpus so
+    far; revisit with a bone-parent path if one appears).
+    """
+    if root is None:
+        return None
+    best: bpy.types.Object | None = None
+    best_depth = 1 << 30
+    for obj in root.children_recursive:
+        if obj.name.split(".")[0] != name:
+            continue
+        depth = 0
+        parent = obj.parent
+        while parent is not None and parent != root:
+            depth += 1
+            parent = parent.parent
+        if depth < best_depth:
+            best_depth = depth
+            best = obj
+    return best
 
 
 def apply_content_filter(
@@ -485,6 +616,22 @@ def apply_content_filter(
     return filtered, kept
 
 
+def resolve_exterior(
+    exteriors: tuple[Exterior, ...], exterior_id: str,
+) -> Exterior | None:
+    """Find an exterior by id (exact, else case-insensitive), else by
+    display_name. Returns None when not found — caller reports the
+    available ids."""
+    for e in exteriors:
+        if e.exterior_id == exterior_id:
+            return e
+    lowered = exterior_id.lower()
+    for e in exteriors:
+        if e.exterior_id.lower() == lowered or e.display_name.lower() == lowered:
+            return e
+    return None
+
+
 def resolve_skin(skins: tuple[Skin, ...], skin_id: str) -> Skin | None:
     """Find a skin by ``skin_id``, else by ``display_name`` (case-insensitive).
 
@@ -510,6 +657,7 @@ def build_ship(
     bind_materials: bool = True,
     library_root_override: str | Path | None = None,
     skin_id: str = DEFAULT_SKIN_ID,
+    exterior_id: str | None = None,
     lod_policy: str = "lod0",
     damage_variants: bool = False,
     overlays: bool = False,
@@ -517,6 +665,14 @@ def build_ship(
     on_warning: Callable[[str], None] | None = None,
 ) -> BuildResult:
     """Build one ship into the current scene and return what happened.
+
+    ``exterior_id`` selects a mesh-swap exterior from ``exteriors[]``
+    (Unity ExteriorComposer parity): the exterior's hull GLB replaces the
+    base hull, its ``mounts[]`` swap per-hardpoint assets with their own
+    matrices + misc filters, its decoratives file replaces the base
+    hull's ``skel_ext_hash`` decoratives layer wholesale, and its
+    ``camo_scheme_key`` auto-selects the paint skin unless ``skin_id``
+    names one explicitly.
 
     Raises ``FileNotFoundError`` when the sidecar or hull GLB is absent —
     those are hard errors that leave nothing usable in the scene. Softer
@@ -542,6 +698,27 @@ def build_ship(
     ship_stem = sidecar_path.name.removesuffix(".meta.json")
     models_dir = ship_dir / "models"
     hull_glb = models_dir / f"{ship_stem}_hull.glb"
+
+    # ---- exterior resolution -----------------------------------------
+    exterior: Exterior | None = None
+    if exterior_id:
+        exterior = resolve_exterior(sidecar.exteriors, exterior_id)
+        if exterior is None:
+            available = ", ".join(e.exterior_id for e in sidecar.exteriors) or "(none)"
+            raise FileNotFoundError(
+                f"exterior {exterior_id!r} not in this sidecar; available: {available}"
+            )
+    ext_hull = exterior.hull if exterior is not None else None
+    if ext_hull is not None and ext_hull.hull_glb:
+        ext_hull_path = ship_dir / ext_hull.hull_glb
+        if ext_hull_path.is_file():
+            hull_glb = ext_hull_path
+        else:
+            warn(
+                f"exterior hull GLB not found: {ext_hull_path} — re-ingest the "
+                f"ship with --exterior-hulls; building on the BASE hull."
+            )
+            ext_hull = None
     if not hull_glb.is_file():
         raise FileNotFoundError(f"hull GLB not found: {hull_glb}")
 
@@ -551,6 +728,9 @@ def build_ship(
     publish_root = ship_dir.parent
 
     skins = load_skins(sidecar.skins)
+    # An exterior names its paint scheme; an explicit --skin still wins.
+    if exterior is not None and (not skin_id or skin_id == DEFAULT_SKIN_ID):
+        skin_id = exterior.camo_scheme_key or DEFAULT_SKIN_ID
     skin = resolve_skin(skins, skin_id)
     if skin_id and skin_id != DEFAULT_SKIN_ID and skin is None:
         warn(
@@ -562,6 +742,17 @@ def build_ship(
     # ``main`` inside bind_material, so this is safe to pass through.
     scheme = skin.scheme_key if skin is not None else DEFAULT_SCHEME
 
+    # Camo opt-out set: bespoke variant assets carry their own themed
+    # albedos — the flat mat tile / palette would clobber the detail
+    # (webview `variantSwappedAssetIds` + ship-level camo_skip rule).
+    camo_skip: set[str] = set()
+    ship_block = sidecar.raw.get("ship")
+    if isinstance(ship_block, dict):
+        camo_skip.update(str(x) for x in ship_block.get("camo_skip_asset_ids") or [])
+        camo_skip.update(str(x) for x in ship_block.get("variant_swapped_asset_ids") or [])
+    if exterior is not None:
+        camo_skip.update(exterior.variant_swapped_asset_ids)
+
     # Ship root empty — everything lands underneath it for easy
     # selection + cleanup.
     root = bpy.data.objects.new(f"{sidecar.ship_name}_root", None)
@@ -571,6 +762,8 @@ def build_ship(
     root["wows_ship_name"]      = sidecar.ship_name
     root["wows_schema_version"] = sidecar.schema_version
     root["wows_skin_id"]        = skin.skin_id if skin is not None else DEFAULT_SKIN_ID
+    if exterior is not None:
+        root["wows_exterior_id"] = exterior.exterior_id
 
     # Hull.
     hull_objs = _import_glb(hull_glb)
@@ -585,17 +778,30 @@ def build_ship(
     bound_count = 0
     camo_count = 0
     if bind_materials:
-        bound_count, camo_count = _bind_materials(
-            hull_root, material_lookup, models_dir,
-            scheme=scheme, skin=skin, publish_root=publish_root,
-        )
+        if ext_hull is not None:
+            # Exterior hull: its OWN material block (base entries fill any
+            # id the exterior doesn't carry), and NO camo overlay — the
+            # bespoke albedo IS the skin; engine-side, mg.B is authored 0
+            # on bespoke variant geometry so the paint never lands there.
+            ext_lookup = dict(material_lookup)
+            ext_lookup.update({m.material_id: m for m in ext_hull.materials})
+            bound_count, camo_count = _bind_materials(
+                hull_root, ext_lookup, models_dir,
+                scheme=DEFAULT_SCHEME, skin=None, publish_root=publish_root,
+            )
+        else:
+            bound_count, camo_count = _bind_materials(
+                hull_root, material_lookup, models_dir,
+                scheme=scheme, skin=skin, publish_root=publish_root,
+            )
 
     if library_root_override:
         library_root = Path(library_root_override)
     else:
         library_root = publish_root / "accessories"
 
-    placed = skipped = attached = attached_filtered = 0
+    stats = _PlaceStats()
+    deco_placed = 0
     if import_accessories and library_root.is_dir():
         index_path = library_root / "index.json"
         if not index_path.is_file():
@@ -606,10 +812,37 @@ def build_ship(
             except Exception as e:  # noqa: BLE001
                 warn(f"library parse failed: {e}")
             else:
-                placed, skipped, attached, attached_filtered = _import_accessory_placements(
+                # A hull-swap exterior with a decoratives file replaces
+                # the base hull's skel_ext decoratives layer wholesale.
+                mount_swaps = (
+                    {m.hp_name: m for m in exterior.mounts}
+                    if exterior is not None else None
+                )
+                replaces_deco = bool(
+                    ext_hull is not None and ext_hull.decoratives
+                )
+                stats = _import_accessory_placements(
                     sidecar.placements, library, library_root, root,
                     misc_filters=_misc_filter_from_sidecar(sidecar.raw),
+                    mount_swaps=mount_swaps,
+                    skip_skel_ext=replaces_deco,
+                    on_warning=warn,
                 )
+                if replaces_deco:
+                    deco_path = ship_dir / ext_hull.decoratives
+                    if deco_path.is_file():
+                        deco_stats = _import_accessory_placements(
+                            load_decoratives(deco_path), library,
+                            library_root, root,
+                            on_warning=warn,
+                        )
+                        deco_placed = deco_stats.placed
+                        stats.placed += deco_stats.placed
+                        stats.skipped += deco_stats.skipped
+                        stats.attached += deco_stats.attached
+                        stats.attached_filtered += deco_stats.attached_filtered
+                    else:
+                        warn(f"exterior decoratives file not found: {deco_path}")
                 if bind_materials:
                     # Bind materials on every instantiated accessory.
                     # Accessory materials live inside the library index
@@ -636,7 +869,9 @@ def build_ship(
                             per_asset_materials[asset_id] = cache
                         a_bound, a_camo = _bind_materials(
                             child, cache, asset_root,
-                            scheme=scheme, skin=skin, publish_root=publish_root,
+                            scheme=scheme,
+                            skin=None if asset_id in camo_skip else skin,
+                            publish_root=publish_root,
                         )
                         bound_count += a_bound
                         camo_count += a_camo
@@ -659,13 +894,17 @@ def build_ship(
     return BuildResult(
         root=root,
         ship_name=sidecar.ship_name,
-        placed=placed,
-        skipped=skipped,
-        attached=attached,
-        attached_filtered=attached_filtered,
+        placed=stats.placed,
+        skipped=stats.skipped,
+        attached=stats.attached,
+        attached_filtered=stats.attached_filtered,
         slots_bound=bound_count,
         camo_applied=camo_count,
         skin_id=skin.skin_id if skin is not None else DEFAULT_SKIN_ID,
+        exterior_id=exterior.exterior_id if exterior is not None else None,
+        mounts_swapped=stats.mounts_swapped,
+        decoratives_placed=deco_placed,
+        base_decoratives_dropped=stats.skel_ext_dropped,
         meshes_kept=kept,
         meshes_filtered=filtered,
         warnings=warnings,
@@ -684,5 +923,6 @@ __all__ = [
     "apply_content_filter",
     "build_ship",
     "list_skins",
+    "resolve_exterior",
     "resolve_skin",
 ]

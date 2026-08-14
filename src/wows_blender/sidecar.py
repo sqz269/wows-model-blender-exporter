@@ -78,6 +78,10 @@ class Placement:
     attached_y_flip: bool = False
     dead_asset_id:   str | None = None
     misc_filter:     tuple[str, ...] | None = None
+    #: Placement provenance. ``"skel_ext_hash"`` marks the hull's baked
+    #: decoratives layer — the set a hull-swap exterior replaces wholesale
+    #: with its own decoratives file (Unity ExteriorComposer parity).
+    source:          str | None = None
 
 
 @dataclass(frozen=True)
@@ -134,6 +138,63 @@ class Skin:
 
 
 @dataclass(frozen=True)
+class ExteriorMount:
+    """One ``exteriors[].mounts[]`` record — a per-hardpoint asset swap.
+
+    ``misc_filter`` is TRI-STATE, mirroring the WG nodesConfig override
+    (Unity ExteriorComposer parity): ``None`` = field absent = keep every
+    attached child; ``()`` = drop all; non-empty = whitelist by
+    ``placement_id``. It replaces the vanilla whitelist VERBATIM.
+
+    ``matrix`` is the exterior's own placement matrix with the schema_v6
+    bone-mismatch Ry(180°) conjugation already baked in — consumers
+    decompose verbatim, never re-derive from the base placement. ``None``
+    for transform-less swaps (asset/misc-filter-only): mirror the base.
+
+    ``attach_to`` marks turret-rider mounts (composite hp names like
+    ``HP_AGM_3_HP_AGA_4``): the rider parents to the variant host
+    turret's matching child node at identity local, or is dropped when
+    the variant model has no such node (WG's visual exclusion).
+    """
+
+    hp_name:         str
+    asset_id:        str | None
+    base_asset_id:   str | None = None
+    dead_asset_id:   str | None = None
+    attach_to:       str | None = None
+    matrix:          tuple[float, ...] | None = None
+    misc_filter:     tuple[str, ...] | None = None
+    attached_y_flip: bool = False
+
+
+@dataclass(frozen=True)
+class ExteriorHull:
+    """The ``exteriors[].hull`` block — present when the exterior swaps
+    hull geometry (re-ingested with ``--exterior-hulls``)."""
+
+    hull_glb:          str | None = None
+    material_mappings: str | None = None
+    decoratives:       str | None = None
+    materials:         tuple[MaterialEntry, ...] = ()
+
+
+@dataclass(frozen=True)
+class Exterior:
+    """One ``exteriors[]`` entry — a permoflage that may swap hull
+    geometry, mounts, and decoratives on top of the canonical ship."""
+
+    exterior_id:     str
+    display_name:    str
+    wg_asset_id:     str | None = None
+    peculiarity:     str | None = None
+    camo_scheme_key: str | None = None
+    is_native:       bool = False
+    hull:            ExteriorHull | None = None
+    mounts:          tuple[ExteriorMount, ...] = ()
+    variant_swapped_asset_ids: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
 class Sidecar:
     """Parsed view over a ``<Ship>.meta.json`` document.
 
@@ -146,6 +207,7 @@ class Sidecar:
     materials:    tuple[MaterialEntry, ...]
     placements:   tuple[Placement, ...]
     skins:        tuple[dict[str, Any], ...] = ()
+    exteriors:    tuple[Exterior, ...] = ()
     raw:          dict[str, Any] = field(default_factory=dict)
 
 
@@ -226,6 +288,7 @@ def _coerce_placement(role: str, raw: dict[str, Any]) -> Placement | None:
         attached_y_flip=bool(raw.get("attached_y_flip", False)),
         dead_asset_id=raw.get("dead_asset_id"),
         misc_filter=misc_filter,
+        source=raw.get("source"),
     )
 
 
@@ -291,6 +354,87 @@ def load_accessories(path: Path) -> tuple[Placement, ...]:
     return tuple(out)
 
 
+def _coerce_exterior_mount(raw: dict[str, Any]) -> ExteriorMount | None:
+    hp = raw.get("hp_name")
+    if not hp:
+        return None
+    matrix_raw = (raw.get("transform") or {}).get("matrix")
+    matrix: tuple[float, ...] | None = None
+    if isinstance(matrix_raw, list) and len(matrix_raw) == 16:
+        matrix = tuple(float(v) for v in matrix_raw)
+    mf_raw = raw.get("misc_filter")
+    misc_filter = tuple(str(x) for x in mf_raw) if isinstance(mf_raw, list) else None
+    return ExteriorMount(
+        hp_name=str(hp),
+        asset_id=raw.get("asset_id") or None,
+        base_asset_id=raw.get("base_asset_id") or None,
+        dead_asset_id=raw.get("dead_asset_id") or None,
+        attach_to=raw.get("attach_to") or None,
+        matrix=matrix,
+        misc_filter=misc_filter,
+        attached_y_flip=bool(raw.get("attached_y_flip", False)),
+    )
+
+
+def _coerce_exterior(raw: dict[str, Any]) -> Exterior | None:
+    ext_id = raw.get("exterior_id")
+    if not ext_id:
+        return None
+    hull_raw = raw.get("hull")
+    hull: ExteriorHull | None = None
+    if isinstance(hull_raw, dict):
+        hull = ExteriorHull(
+            hull_glb=hull_raw.get("hull_glb") or None,
+            material_mappings=hull_raw.get("material_mappings") or None,
+            decoratives=hull_raw.get("decoratives") or None,
+            materials=tuple(
+                _coerce_material(m) for m in (hull_raw.get("materials") or [])
+                if isinstance(m, dict)
+            ),
+        )
+    mounts = tuple(
+        m for m in (
+            _coerce_exterior_mount(r) for r in (raw.get("mounts") or [])
+            if isinstance(r, dict)
+        )
+        if m is not None
+    )
+    return Exterior(
+        exterior_id=str(ext_id),
+        display_name=str(raw.get("display_name") or ext_id),
+        wg_asset_id=raw.get("wg_asset_id") or None,
+        peculiarity=raw.get("peculiarity") or None,
+        camo_scheme_key=raw.get("camo_scheme_key") or None,
+        is_native=bool(raw.get("is_native", False)),
+        hull=hull,
+        mounts=mounts,
+        variant_swapped_asset_ids=tuple(
+            str(x) for x in (raw.get("variant_swapped_asset_ids") or [])
+        ),
+    )
+
+
+def load_exteriors(raw_exteriors: Any) -> tuple[Exterior, ...]:
+    """Parse the sidecar's ``exteriors[]`` into typed :class:`Exterior`s."""
+    return tuple(
+        e for e in (
+            _coerce_exterior(r) for r in (raw_exteriors or [])
+            if isinstance(r, dict)
+        )
+        if e is not None
+    )
+
+
+def load_decoratives(path: Path) -> tuple[Placement, ...]:
+    """Parse an exterior's ``*_decoratives.json``.
+
+    The file shares the accessories.json shape (five typed placement
+    groups), so this is :func:`load_accessories` under a name that says
+    what it's for.
+    """
+    return load_accessories(path)
+
+
 def load_ship(sidecar_path: Path) -> Sidecar:
     """Convenience: load sidecar + paired accessories.json in one call.
 
@@ -312,6 +456,7 @@ def load_ship(sidecar_path: Path) -> Sidecar:
         materials=sc.materials,
         placements=placements,
         skins=sc.skins,
+        exteriors=load_exteriors(sc.raw.get("exteriors")),
         raw=sc.raw,
     )
 
@@ -411,10 +556,15 @@ __all__ = [
     "CamoCategory",
     "MatTexture",
     "Skin",
+    "ExteriorMount",
+    "ExteriorHull",
+    "Exterior",
     "Sidecar",
     "coerce_material",
     "coerce_skin",
     "load_skins",
+    "load_exteriors",
+    "load_decoratives",
     "load_sidecar",
     "load_accessories",
     "load_ship",

@@ -54,6 +54,11 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--out", type=Path, help="Destination .fbx path.")
     ap.add_argument("--manifest", type=Path, help="Destination material-manifest JSON.")
     ap.add_argument("--skin", default="default")
+    ap.add_argument("--exterior", default="",
+                    help="Build a mesh-swap exterior from the sidecar's "
+                         "exteriors[] (id or display name): variant hull, "
+                         "mount swaps, decoratives, and its paint scheme "
+                         "(--skin still overrides the paint).")
     ap.add_argument("--library", default="", help="Override accessories/ library root.")
     ap.add_argument("--no-accessories", action="store_true")
     ap.add_argument("--no-materials", action="store_true")
@@ -61,7 +66,8 @@ def _build_parser() -> argparse.ArgumentParser:
                     help="'lod0' (default) keeps the high-detail meshes; "
                          "'lodN' keeps only level N; 'all' keeps every LOD.")
     ap.add_argument("--damage-variants", action="store_true",
-                    help="Keep crack / patch damage-state meshes.")
+                    help="Keep the broken-seam crack meshes too (the intact "
+                         "seam patches are always kept).")
     ap.add_argument("--overlays", action="store_true",
                     help="Keep the Armor / Hitboxes collision volumes.")
     ap.add_argument("--combine", action="store_true",
@@ -78,6 +84,8 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--save-blend", type=Path, help="Also save the assembled .blend.")
     ap.add_argument("--list-skins", action="store_true",
                     help="Print the sidecar's skins as JSON and exit.")
+    ap.add_argument("--list-exteriors", action="store_true",
+                    help="Print the sidecar's exteriors[] as JSON and exit.")
     ap.add_argument("--result-json", type=Path,
                     help="Write the machine-readable result here. Preferred "
                          "over scraping stdout: Blender interleaves its own "
@@ -132,8 +140,27 @@ def main() -> int:
         print("WOWS_SKINS_JSON " + json.dumps(payload))
         return EXIT_OK
 
+    if args.list_exteriors:
+        from wows_blender.sidecar import load_exteriors, load_sidecar
+
+        payload = [
+            {
+                "exterior_id":   e.exterior_id,
+                "display_name":  e.display_name,
+                "peculiarity":   e.peculiarity,
+                "camo_scheme":   e.camo_scheme_key,
+                "hull_glb":      e.hull.hull_glb if e.hull else None,
+                "decoratives":   e.hull.decoratives if e.hull else None,
+                "mounts":        len(e.mounts),
+            }
+            for e in load_exteriors(load_sidecar(args.sidecar).raw.get("exteriors"))
+        ]
+        _write_result(args.result_json, {"exteriors": payload})
+        print("WOWS_EXTERIORS_JSON " + json.dumps(payload))
+        return EXIT_OK
+
     if args.out is None:
-        print("error: --out is required unless --list-skins", file=sys.stderr)
+        print("error: --out is required unless --list-skins/--list-exteriors", file=sys.stderr)
         return EXIT_ARGS
 
     _clear_scene()
@@ -146,6 +173,7 @@ def main() -> int:
             bind_materials=not args.no_materials,
             library_root_override=args.library or None,
             skin_id=args.skin,
+            exterior_id=args.exterior or None,
             lod_policy=args.lod,
             damage_variants=args.damage_variants,
             overlays=args.overlays,
@@ -177,10 +205,14 @@ def main() -> int:
         if args.bake:
             # Bake BEFORE the prep rewrite — baking evaluates the real
             # render graph (camo composite + AO multiply), which the prep
-            # pass is about to bypass.
+            # pass is about to bypass. After --combine the ship root
+            # empty no longer exists (combine deletes the scaffolding),
+            # so fall back to the whole-scene walk — which also bakes
+            # the deduped 129 materials instead of the raw 571.
             bake_dir = args.out.parent / f"{args.out.stem}_baked"
             counts = bake_base_color(
-                result.root, bake_dir, size=args.bake_size, counts=counts,
+                result.root if combine_stats is None else None,
+                bake_dir, size=args.bake_size, counts=counts,
             )
             for note in counts.notes:
                 print(f"warn: {note}", file=sys.stderr)
@@ -239,6 +271,9 @@ def main() -> int:
         "size":     size,
         "manifest": str(manifest_path),
         "skin":     result.skin_id,
+        "exterior": result.exterior_id,
+        "mounts_swapped":     result.mounts_swapped,
+        "decoratives_placed": result.decoratives_placed,
         "ship":     result.ship_name,
         "placed":   result.placed,
         "meshes_kept":     result.meshes_kept,
