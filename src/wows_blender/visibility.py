@@ -42,8 +42,21 @@ def lod_level_of_name(name: str) -> int:
 
 
 def is_damage_variant(name: str) -> bool:
-    """True for crack / patch meshes — hidden unless explicitly asked for."""
+    """True for crack / patch meshes — the per-seam damage geometry."""
     return bool(PATCH_RE.search(name) or CRACK_RE.search(name))
+
+
+def is_crack(name: str) -> bool:
+    """True for the broken-seam edge meshes (``<A>_crack_<B>*``).
+
+    Per-seam damage semantics (webview `types.ts` SeamState contract):
+    the INTACT ship shows the ``_patch_`` bridge meshes and hides both
+    ``_crack_`` edges; a broken seam swaps them. So an intact export must
+    KEEP patches — dropping them leaves a 1-3 m hull hole at every
+    section seam (caught on PAES488_Azur_Baltimore: MidFront ends y=64.5,
+    Bow starts y=67.0, and only ``Bow_patch_MidFront*`` spans the gap).
+    """
+    return bool(CRACK_RE.search(name))
 
 
 def short_mesh_name(raw: str) -> str:
@@ -80,11 +93,16 @@ def keeps_mesh(
 
     ``lod_policy`` of ``'all'`` keeps every level; ``'lodN'`` keeps only
     level N (so ``'lod0'``, the default, keeps the high-detail hull).
+
+    Damage semantics are PER-SEAM (webview SeamState contract): the
+    default intact export keeps the ``_patch_`` seam bridges (they ARE
+    the hull between sections) and drops the ``_crack_`` broken edges;
+    ``damage_variants=True`` keeps the cracks too.
     """
     target = lod_policy_level(lod_policy)
     if target is not None and lod_level_of_name(name) != target:
         return False
-    if not damage_variants and is_damage_variant(name):
+    if not damage_variants and is_crack(name):
         return False
     return True
 
@@ -96,6 +114,7 @@ __all__ = [
     "HULL_HIDDEN_GROUPS",
     "lod_level_of_name",
     "is_damage_variant",
+    "is_crack",
     "short_mesh_name",
     "lod_policy_level",
     "keeps_mesh",

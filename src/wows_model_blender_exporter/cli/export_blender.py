@@ -190,8 +190,10 @@ def _build_parser() -> argparse.ArgumentParser:
     fbx.add_argument(
         "--damage-variants",
         action="store_true",
-        help="Keep the crack / patch damage-state meshes. They sit on top "
-             "of the intact geometry, so this is off by default.",
+        help="Keep the broken-seam crack meshes too. The intact seam "
+             "patches are always kept (they ARE the hull between "
+             "sections); cracks sit on top of them, so this is off by "
+             "default.",
     )
     fbx.add_argument(
         "--overlays",
