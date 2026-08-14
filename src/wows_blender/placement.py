@@ -52,24 +52,34 @@ from collections.abc import Sequence
 #     +Z = up
 #     -Y = forward
 #
-# Mapping is a Y↔Z swap (positive — both -Z_g and -Y_b point "bow
-# forward," and +Y_g (up) matches +Z_b (up)):
+# The conversion MUST be the same one Blender's stock glTF importer
+# applies to the hull/accessory meshes — the proper rotation X+90°
+# (det = +1):
 #     X_b = +X_g
-#     Y_b = +Z_g
+#     Y_b = -Z_g
 #     Z_b = +Y_g
 #
-# The matrix is its own inverse (involutive — a basis swap, no sign
-# change), so GLTF_TO_BLENDER_BASIS == BLENDER_TO_GLTF_BASIS. Keep
-# the two names anyway because the conjugation B·M·B^-1 reads more
-# naturally with explicit direction labels.
+# NOT the naive Y↔Z swap (x, z, y). The swap is a reflection
+# (det = -1): positions land fore-aft reversed relative to the
+# imported hull and every non-0/180° yaw comes out mirrored — front
+# turrets on the stern. (A 180° yaw is invariant under the mirrored
+# conjugation, which is why relative fore↔aft probes pass under the
+# broken swap; only comparison against the hull mesh catches it.)
 GLTF_TO_BLENDER_BASIS: tuple[tuple[float, ...], ...] = (
-    (1.0, 0.0, 0.0, 0.0),
-    (0.0, 0.0, 1.0, 0.0),
-    (0.0, 1.0, 0.0, 0.0),
-    (0.0, 0.0, 0.0, 1.0),
+    (1.0, 0.0,  0.0, 0.0),
+    (0.0, 0.0, -1.0, 0.0),
+    (0.0, 1.0,  0.0, 0.0),
+    (0.0, 0.0,  0.0, 1.0),
 )
 
-BLENDER_TO_GLTF_BASIS: tuple[tuple[float, ...], ...] = GLTF_TO_BLENDER_BASIS
+# Inverse of the above (rotation X-90°). A rotation's inverse is its
+# transpose — no longer involutive like the old (wrong) swap basis.
+BLENDER_TO_GLTF_BASIS: tuple[tuple[float, ...], ...] = (
+    (1.0,  0.0, 0.0, 0.0),
+    (0.0,  0.0, 1.0, 0.0),
+    (0.0, -1.0, 0.0, 0.0),
+    (0.0,  0.0, 0.0, 1.0),
+)
 
 
 def column_major_to_row_major(m16: Sequence[float]) -> list[list[float]]:
@@ -105,23 +115,22 @@ def gltf_matrix_to_blender_rows(m16: Sequence[float]) -> list[list[float]]:
     row-major matrix.
 
     Conjugation form: ``M_b = GB · M_g · BG`` where ``GB`` is the
-    glTF→Blender basis and ``BG`` is its inverse. With the involutive
-    swap (``GB == BG``) this collapses to ``GB · M_g · GB``. The
-    swap rotates the entire transform — translation, rotation, and
-    scale — from glTF's +Y-up basis into Blender's +Z-up basis. Without
-    it, accessories would land at the right distance from origin but
-    rotated 90° around X (deck pointing port-side instead of upward).
+    glTF→Blender rotation (X+90°) and ``BG`` its inverse (X-90°).
+    The conjugation rotates the entire transform — translation,
+    rotation, and scale — from glTF's +Y-up basis into Blender's
+    +Z-up basis, matching what the stock glTF importer does to the
+    mesh data the placements must line up with.
     """
     rows = column_major_to_row_major(m16)
     return matmul4(GLTF_TO_BLENDER_BASIS, matmul4(rows, BLENDER_TO_GLTF_BASIS))
 
 
 def gltf_position_to_blender(p_gltf: Sequence[float]) -> tuple[float, float, float]:
-    """Apply the (+Y up → +Z up) Y↔Z swap to a position vector.
+    """Apply the (+Y up → +Z up) X+90° rotation to a position vector.
 
-    Mirrors the basis swap in :data:`GLTF_TO_BLENDER_BASIS`.
+    Mirrors the basis rotation in :data:`GLTF_TO_BLENDER_BASIS`.
     """
-    return (p_gltf[0], p_gltf[2], p_gltf[1])
+    return (p_gltf[0], -p_gltf[2], p_gltf[1])
 
 
 def is_finite_matrix(m16: Sequence[float]) -> bool:
