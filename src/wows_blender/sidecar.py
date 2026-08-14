@@ -81,6 +81,59 @@ class Placement:
 
 
 @dataclass(frozen=True)
+class ColorScheme:
+    """A skin's 4-row palette (Path A). ``colors`` are linear RGBA; the
+    ``.a`` of each row is its premix weight against the base."""
+
+    name:   str
+    colors: tuple[tuple[float, float, float, float], ...] = ()
+
+
+@dataclass(frozen=True)
+class CamoCategory:
+    """One ``skin.categories[cat]`` entry — Path A mask and/or Path B mgn
+    for a part category (tile/deckhouse/bulge/gun/...)."""
+
+    mask:      tuple[str, ...] = ()   # Path A zone-mask dds_mips
+    mgn:       tuple[str, ...] = ()   # Path B mgn dds_mips
+    uv_scale:  tuple[float, float] = (1.0, 1.0)
+    uv_offset: tuple[float, float] = (0.0, 0.0)
+    params:    dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class MatTexture:
+    """One ``skin.mat_textures[cat]`` entry — Path B pre-baked albedo
+    (+ optional mgn) for a part category."""
+
+    albedo:    tuple[str, ...] = ()
+    mgn:       tuple[str, ...] = ()
+    uv_scale:  tuple[float, float] = (1.0, 1.0)
+    uv_offset: tuple[float, float] = (0.0, 0.0)
+    params:    dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class Skin:
+    """One ``skins[]`` entry. ``skin_id == 'default'`` is the bare ship.
+
+    Path A is driven by ``color_scheme`` + ``categories[cat].mask``;
+    Path B by ``mat_textures[cat]``. ``scheme_key`` selects the material
+    ``texture_sets`` block to sample (usually ``main``)."""
+
+    skin_id:      str
+    scheme_key:   str
+    display_name: str
+    kind:         str | None = None
+    exterior_id:  str | None = None
+    color_scheme: ColorScheme | None = None
+    categories:   dict[str, CamoCategory] = field(default_factory=dict)
+    mat_textures: dict[str, MatTexture] = field(default_factory=dict)
+    params:       dict[str, Any] = field(default_factory=dict)
+    raw:          dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class Sidecar:
     """Parsed view over a ``<Ship>.meta.json`` document.
 
@@ -263,12 +316,105 @@ def load_ship(sidecar_path: Path) -> Sidecar:
     )
 
 
+def _mips(raw: Any) -> tuple[str, ...]:
+    if not isinstance(raw, dict):
+        return ()
+    m = raw.get("dds_mips") or ()
+    if isinstance(m, str):
+        return (m,)
+    return tuple(str(x) for x in m)
+
+
+def _uv(raw: Any) -> tuple[tuple[float, float], tuple[float, float]]:
+    uv = raw.get("uv") if isinstance(raw, dict) else None
+    uv = uv or {}
+    scale = uv.get("scale") or (1.0, 1.0)
+    offset = uv.get("offset") or (0.0, 0.0)
+    return (
+        (float(scale[0]), float(scale[1])),
+        (float(offset[0]), float(offset[1])),
+    )
+
+
+def _coerce_color_scheme(raw: Any) -> ColorScheme | None:
+    if not isinstance(raw, dict):
+        return None
+    cols: list[tuple[float, float, float, float]] = []
+    for c in raw.get("colors") or []:
+        if isinstance(c, (list, tuple)) and len(c) >= 3:
+            cols.append((
+                float(c[0]), float(c[1]), float(c[2]),
+                float(c[3]) if len(c) > 3 else 1.0,
+            ))
+    return ColorScheme(name=str(raw.get("name") or ""), colors=tuple(cols))
+
+
+def _coerce_camo_category(raw: dict[str, Any]) -> CamoCategory:
+    scale, offset = _uv(raw)
+    return CamoCategory(
+        mask=_mips(raw.get("mask")),
+        mgn=_mips(raw.get("mgn")),
+        uv_scale=scale,
+        uv_offset=offset,
+        params=dict(raw.get("params") or {}),
+    )
+
+
+def _coerce_mat_texture(raw: dict[str, Any]) -> MatTexture:
+    scale, offset = _uv(raw)
+    return MatTexture(
+        albedo=_mips(raw.get("albedo")),
+        mgn=_mips(raw.get("mgn")),
+        uv_scale=scale,
+        uv_offset=offset,
+        params=dict(raw.get("params") or {}),
+    )
+
+
+def coerce_skin(raw: dict[str, Any]) -> Skin:
+    cats = {
+        k: _coerce_camo_category(v)
+        for k, v in (raw.get("categories") or {}).items()
+        if isinstance(v, dict)
+    }
+    mts = {
+        k: _coerce_mat_texture(v)
+        for k, v in (raw.get("mat_textures") or {}).items()
+        if isinstance(v, dict)
+    }
+    return Skin(
+        skin_id=str(raw.get("skin_id") or ""),
+        scheme_key=str(raw.get("scheme_key") or "main"),
+        display_name=str(raw.get("display_name") or raw.get("skin_id") or ""),
+        kind=raw.get("kind"),
+        exterior_id=raw.get("exterior_id"),
+        color_scheme=_coerce_color_scheme(raw.get("color_scheme")),
+        categories=cats,
+        mat_textures=mts,
+        params=dict(raw.get("params") or {}),
+        raw=dict(raw),
+    )
+
+
+def load_skins(raw_skins: Any) -> tuple[Skin, ...]:
+    """Parse the sidecar's ``skins[]`` into typed :class:`Skin` objects."""
+    return tuple(
+        coerce_skin(s) for s in (raw_skins or []) if isinstance(s, dict)
+    )
+
+
 __all__ = [
     "TextureRef",
     "MaterialEntry",
     "Placement",
+    "ColorScheme",
+    "CamoCategory",
+    "MatTexture",
+    "Skin",
     "Sidecar",
     "coerce_material",
+    "coerce_skin",
+    "load_skins",
     "load_sidecar",
     "load_accessories",
     "load_ship",

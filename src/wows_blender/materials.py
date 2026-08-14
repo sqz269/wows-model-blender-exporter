@@ -497,4 +497,21 @@ def bind_material(
     return len(bound)
 
 
-__all__ = ["DEFAULT_SCHEME", "bind_material"]
+def resolve_texture_png(model_root: Path, ref: TextureRef) -> Path | None:
+    """Public alias for the slot->PNG probe, so the camo overlay can
+    resolve the slots this module deliberately leaves unbound
+    (``camoExclusionMask`` / ``camoMask``)."""
+    return _resolve_png_for_texture(model_root, ref)
+
+
+def load_image(path: Path, *, colorspace: str = "sRGB") -> bpy.types.Image | None:
+    """Public alias for the deduplicating image loader."""
+    return _load_image(path, colorspace=colorspace)
+
+
+__all__ = [
+    "DEFAULT_SCHEME",
+    "bind_material",
+    "resolve_texture_png",
+    "load_image",
+]
