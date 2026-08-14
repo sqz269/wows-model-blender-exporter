@@ -273,12 +273,18 @@ def bake_base_color(
 
     # One bake target per material, made the active node so Cycles writes
     # into it. Materials with no UV-mapped mesh are skipped by Blender.
+    # Each target is sized to the material's SOURCE albedo (capped at
+    # ``size``): a 256² fitting must not become a 2048² bake — measured
+    # on Azur Baltimore, uniform 2048² bakes ballooned the Unity bundle
+    # from ~70 MB to 516 MB. The camo overlay is low-frequency, so
+    # clamping to the part's native texel density loses nothing visible.
     targets: dict[str, tuple[bpy.types.Material, bpy.types.Image, bpy.types.Node]] = {}
     for mat in {m for o in meshes for m in o.data.materials if m is not None}:
         if not mat.use_nodes:
             continue
+        mat_size = _bake_size_for(mat, size)
         img = bpy.data.images.new(
-            f"{mat.name}_baked", width=size, height=size, alpha=True,
+            f"{mat.name}_baked", width=mat_size, height=mat_size, alpha=True,
         )
         node = mat.node_tree.nodes.new("ShaderNodeTexImage")
         node.image = img
@@ -344,6 +350,25 @@ def bake_base_color(
 
 def _safe_name(name: str) -> str:
     return "".join(c if c.isalnum() or c in "-_." else "_" for c in name)
+
+
+def _bake_size_for(mat: bpy.types.Material, cap: int) -> int:
+    """Bake resolution for one material: the source albedo's larger
+    dimension rounded up to a power of two, capped at ``cap``, floored
+    at 256 (materials with no albedo image bake at min(cap, 1024))."""
+    src = 0
+    for name in ("WoWS_baseColor", "WoWS_camo_matAlbedo"):
+        node = mat.node_tree.nodes.get(name)
+        img = getattr(node, "image", None) if node else None
+        if img is not None and img.size[0] > 0:
+            src = max(img.size[0], img.size[1])
+            break
+    if src <= 0:
+        return min(cap, 1024)
+    p = 256
+    while p < src:
+        p *= 2
+    return min(cap, p)
 
 
 # ---------------------------------------------------------------------------
