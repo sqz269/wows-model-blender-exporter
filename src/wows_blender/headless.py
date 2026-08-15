@@ -204,8 +204,8 @@ def main() -> int:
     if not args.no_materials:
         if args.bake:
             # Bake BEFORE the prep rewrite — baking evaluates the real
-            # render graph (camo composite + AO multiply), which the prep
-            # pass is about to bypass. After --combine the ship root
+            # render graph (the camo composite; AO is excluded), which
+            # the prep pass is about to bypass. After --combine the ship root
             # empty no longer exists (combine deletes the scaffolding),
             # so fall back to the whole-scene walk — which also bakes
             # the deduped 129 materials instead of the raw 571.

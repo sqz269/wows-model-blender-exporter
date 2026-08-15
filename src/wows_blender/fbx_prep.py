@@ -245,13 +245,19 @@ def bake_base_color(
 
     This is what makes camo survive the trip: Path A is a per-pixel
     palette lerp against a mask, which no FBX material slot can express.
-    Baking flattens it (plus the AO multiply) into a plain albedo map
-    that any DCC will show correctly.
+    Baking flattens it into a plain albedo map that any DCC will show
+    correctly.
 
-    Costs the PBR separation — the baked map has AO and paint burned in —
-    so it is opt-in. Runs the Cycles ``DIFFUSE`` pass with direct and
-    indirect light disabled, which evaluates the Base Color input only:
-    no lighting, no samples needed.
+    AO is deliberately EXCLUDED from the bake: folding occlusion into
+    albedo double-counts against the consumer's own ambient occlusion
+    (KK runs SSAO) and dims surfaces under direct light. Every
+    ``WoWS_ao_multiply`` is Fac=0'd for the bake (a MULTIPLY mix at
+    Fac 0 passes Color1 — the albedo/camo chain — straight through)
+    and restored afterwards.
+
+    Runs the Cycles ``DIFFUSE`` pass with direct and indirect light
+    disabled, which evaluates the Base Color input only: no lighting,
+    no samples needed.
     """
     counts = counts or PrepCounts()
     meshes = _mesh_objects(root)
@@ -269,7 +275,18 @@ def bake_base_color(
     scene.render.bake.use_pass_direct = False
     scene.render.bake.use_pass_indirect = False
     scene.render.bake.use_pass_color = True
-    scene.render.bake.margin = 8
+    # Flood-fill the space between UV islands instead of leaving it
+    # black: materials that use a thin slice of a shared atlas (wire
+    # strips, gun subparts) rasterize ~1% of their bake target, and
+    # black filler poisons every mip level — the part renders near-black
+    # at any distance (caught on Azur Baltimore: 12/85 bakes < 5% mean
+    # luminance). EXTEND pushes island edge colors outward; a margin
+    # larger than any target floods completely.
+    scene.render.bake.margin = 4096
+    scene.render.bake.margin_type = "EXTEND"
+    # Don't clear between objects — a material shared by several combined
+    # meshes must accumulate all their islands into one target.
+    scene.render.bake.use_clear = False
 
     # One bake target per material, made the active node so Cycles writes
     # into it. Materials with no UV-mapped mesh are skipped by Blender.
@@ -281,6 +298,14 @@ def bake_base_color(
     targets: dict[str, tuple[bpy.types.Material, bpy.types.Image, bpy.types.Node]] = {}
     for mat in {m for o in meshes for m in o.data.materials if m is not None}:
         if not mat.use_nodes:
+            continue
+        # Cutout / transparent materials keep their SOURCE texture: the
+        # diffuse bake writes UV coverage into alpha, not the texture's
+        # own alpha, so a baked net renders as a solid panel (or, with
+        # alpha-test, disappears entirely). Their camo contribution is
+        # negligible; alpha fidelity is not.
+        intent = str(mat.get("wows_shader_intent") or "").lower()
+        if "cutout" in intent or "transparent" in intent:
             continue
         mat_size = _bake_size_for(mat, size)
         img = bpy.data.images.new(
@@ -298,6 +323,15 @@ def bake_base_color(
         scene.render.engine = prev_engine
         counts.notes.append("bake skipped: no node-based materials")
         return counts
+
+    # AO stays OUT of the bake (see docstring): Fac=0 on the multiply
+    # passes the albedo/camo chain through untouched; restored after.
+    ao_disabled: list[bpy.types.Node] = []
+    for mat, _img, _node in targets.values():
+        ao = mat.node_tree.nodes.get("WoWS_ao_multiply")
+        if ao is not None and ao.inputs["Fac"].default_value > 0.0:
+            ao.inputs["Fac"].default_value = 0.0
+            ao_disabled.append(ao)
 
     for obj in bpy.context.selected_objects:
         obj.select_set(False)
@@ -322,6 +356,9 @@ def bake_base_color(
         counts.notes.append(f"bake failed: {e}")
         logger.warning("bake failed: %s", e)
         return counts
+    finally:
+        for ao in ao_disabled:
+            ao.inputs["Fac"].default_value = 1.0
 
     # Save each baked image and repoint Base Color at it. The bake target
     # node becomes the albedo source, which the prep pass above then sees
@@ -385,7 +422,7 @@ _MANIFEST_SLOTS = (
     ("WoWS_emissive",          "emissive",          "RGB=emissive colour"),
     ("WoWS_camo_mask",         "camoMask",          "RGB=Path A palette-row weights"),
     ("WoWS_camo_gate",         "camoExclusionMask", "R=paint gate (WG mg.B)"),
-    ("WoWS_baseColor_baked",   "bakedBaseColor",    "RGB=flattened albedo (camo + AO burned in)"),
+    ("WoWS_baseColor_baked",   "bakedBaseColor",    "RGB=flattened albedo (camo burned in; AO excluded)"),
 )
 
 
