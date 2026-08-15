@@ -146,12 +146,11 @@ def _ensure_principled(mat: bpy.types.Material) -> tuple[bpy.types.Node, bpy.typ
     if output is None:
         output = nt.nodes.new("ShaderNodeOutputMaterial")
         output.location = (300, 0)
-    # Wire BSDF -> Output if not already linked.
-    if not any(
-        link.from_node is bsdf and link.to_node is output
-        for link in nt.links
-    ):
-        nt.links.new(bsdf.outputs["BSDF"], output.inputs["Surface"])
+    # Wire BSDF -> Output if not already linked. Compare sockets with ==
+    # (RNA equality), never node identity — see _bind_occlusion.
+    surf = output.inputs["Surface"]
+    if not any(l.from_socket == bsdf.outputs["BSDF"] for l in surf.links):
+        nt.links.new(bsdf.outputs["BSDF"], surf)
     return bsdf, output
 
 
@@ -262,11 +261,14 @@ def _bind_occlusion(
     nt = mat.node_tree
     tex_node = _add_tex_node(mat, img, location=(-900, 500), name="occlusion")
 
-    bc_link = None
-    for link in nt.links:
-        if link.to_node is bsdf and link.to_socket.identifier == "Base Color":
-            bc_link = link
-            break
+    # Read the incoming link off the SOCKET, never by comparing
+    # `link.to_node is bsdf`: bpy re-creates Python wrappers per access,
+    # so node identity comparison silently fails on some Blender builds
+    # (observed on 5.0.1) — the albedo link then gets kicked out by the
+    # mix->Base Color link below and every --bake ships tint*AO instead
+    # of albedo*AO (the all-gray-ship bug).
+    bc_in = bsdf.inputs.get("Base Color")
+    bc_link = bc_in.links[0] if (bc_in is not None and bc_in.links) else None
 
     mix = nt.nodes.new("ShaderNodeMixRGB")
     mix.blend_type = "MULTIPLY"
