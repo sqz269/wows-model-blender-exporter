@@ -56,6 +56,7 @@ class SkinnedRigStats:
     attachments_rehung: int = 0
     fk_bones: int = 0
     barrels_created: int = 0
+    poses_normalized: int = 0
     notes: list[str] = field(default_factory=list)
 
     def summary(self) -> str:
@@ -64,7 +65,69 @@ class SkinnedRigStats:
                 f"{self.bones_canonicalized} FK frames canonicalized, "
                 f"{self.fk_bones} FK bones, "
                 f"{self.barrels_created} barrel bones synthesized, "
+                f"{self.poses_normalized} import poses normalized, "
                 f"{self.attachments_rehung} attachments re-hung")
+
+
+_IDENTITY4 = mathutils.Matrix.Identity(4)
+
+
+def _pose_is_identity(arm: bpy.types.Object) -> bool:
+    for pb in arm.pose.bones:
+        d = pb.matrix_basis - _IDENTITY4
+        if max(abs(v) for row in d for v in row) > 1e-5:
+            return False
+    return True
+
+
+def _apply_pose_as_rest(
+    arm: bpy.types.Object,
+    stats: SkinnedRigStats,
+    warn: Callable[[str], None],
+) -> None:
+    """Fold a non-identity import pose into the rest/bind state.
+
+    det<0 (Z-mirror) rigs arrive from glTF with the mirror parked in the
+    POSE — Blender bones cannot carry a mirrored rest, so the importer
+    compensates with a Y180 pose on the BlendBones. Every rest-frame
+    edit below assumes rest==bind==pose (identity), and FBX consumers
+    render skinned meshes bone-relative while Blender renders
+    object-relative at rest: leaving the pose in place ships the mount
+    180° wrong downstream even though the Blender scene looks correct.
+    Normalize: bake the current
+    deform into each mesh, make the pose the rest, re-attach the
+    modifiers — visually a no-op, and rest==bind==pose afterwards.
+    """
+    view = bpy.context.view_layer
+    deformed: list[tuple[bpy.types.Object, str]] = []
+    for obj in bpy.context.scene.objects:
+        if obj.type != "MESH":
+            continue
+        for md in obj.modifiers:
+            if md.type == "ARMATURE" and md.object is arm:
+                deformed.append((obj, md.name))
+                break
+    for obj, md_name in deformed:
+        if obj.data.users > 1:
+            obj.data = obj.data.copy()
+        with bpy.context.temp_override(
+            object=obj, active_object=obj,
+            selected_objects=[obj], selected_editable_objects=[obj],
+        ):
+            try:
+                bpy.ops.object.modifier_apply(modifier=md_name)
+            except RuntimeError as e:
+                warn(f"pose-normalize: modifier_apply failed on {obj.name}: {e}")
+    bpy.ops.object.select_all(action="DESELECT")
+    arm.select_set(True)
+    view.objects.active = arm
+    bpy.ops.object.mode_set(mode="POSE")
+    bpy.ops.pose.armature_apply(selected=False)
+    bpy.ops.object.mode_set(mode="OBJECT")
+    for obj, md_name in deformed:
+        md = obj.modifiers.new(md_name, "ARMATURE")
+        md.object = arm
+    stats.poses_normalized += 1
 
 
 def _weighted_bones(arm: bpy.types.Object) -> set[str]:
@@ -360,6 +423,12 @@ def prepare_skinned_fk(
     armatures = [o for o in bpy.context.scene.objects if o.type == "ARMATURE"]
     for idx, arm in enumerate(armatures):
         stats.armatures += 1
+
+        # det<0 rigs carry the Z-mirror as a POSE, not a rest — fold it
+        # in first or every rest edit below (and the FBX consumer)
+        # composes a stray Y180. Identity-pose rigs skip untouched.
+        if not _pose_is_identity(arm):
+            _apply_pose_as_rest(arm, stats, warn)
 
         # Demote natively BONE-parented children (Roll_Back / HP_gunFire
         # markers, rigid meshes) to plain object parenting FIRST, while
