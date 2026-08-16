@@ -68,7 +68,15 @@ class CombineStats:
 
 
 def _material_key(mat: bpy.types.Material) -> tuple:
-    """Identity of a material: stripped name + bound slot images."""
+    """Identity of a material: stripped name + slot images + camo identity.
+
+    The camo props are part of the identity: two instances of one class
+    with the SAME slot images can carry DIFFERENT Path-A/B paint
+    (category tile / mode / skin). Without them the merge keeps an
+    arbitrary scene-order winner, so the paint a given part receives
+    differed between exports of the same ship (caught as "the wreck's
+    superstructure paint doesn't match the intact ship's").
+    """
     name = _SUFFIX_RE.sub("", mat.name)
     slots = []
     if mat.use_nodes:
@@ -77,7 +85,11 @@ def _material_key(mat: bpy.types.Material) -> tuple:
             img = getattr(node, "image", None) if node else None
             if img is not None:
                 slots.append((node_name, img.filepath or img.name))
-    return (name, tuple(sorted(slots)))
+    camo = tuple(
+        str(mat.get(k, "")) for k in
+        ("wows_camo_path", "wows_camo_category", "wows_camo_skin", "wows_camo_mode")
+    )
+    return (name, tuple(sorted(slots)), camo)
 
 
 def _bake_to_world(obj: bpy.types.Object, depsgraph) -> None:
