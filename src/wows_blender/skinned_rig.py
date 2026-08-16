@@ -32,6 +32,7 @@ What still has to happen at export time:
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
@@ -54,6 +55,7 @@ class SkinnedRigStats:
     bones_canonicalized: int = 0
     attachments_rehung: int = 0
     fk_bones: int = 0
+    barrels_created: int = 0
     notes: list[str] = field(default_factory=list)
 
     def summary(self) -> str:
@@ -61,6 +63,7 @@ class SkinnedRigStats:
                 f"{self.bones_renamed} bones uniquified, "
                 f"{self.bones_canonicalized} FK frames canonicalized, "
                 f"{self.fk_bones} FK bones, "
+                f"{self.barrels_created} barrel bones synthesized, "
                 f"{self.attachments_rehung} attachments re-hung")
 
 
@@ -104,6 +107,248 @@ def _canonical_bone_matrix(m: mathutils.Matrix) -> mathutils.Matrix:
     ))
 
 
+_ROLLBACK_STEM_RE = re.compile(r"Roll_Back(\d+)")
+_PITCH_DEFORM_RE = re.compile(r"Rotate_X\d*_?BlendBone|Rotate_X_BlendBone")
+
+
+def _rehang_barrel_chains(
+    arm: bpy.types.Object,
+    suffix: str,
+    barrel_chains: dict[int, str],
+    weighted: set[str],
+    fk_records: list[dict],
+    stats: SkinnedRigStats,
+    warn: Callable[[str], None],
+) -> None:
+    """Case B of the barrel synthesis (see _split_barrel_weights)."""
+    bones = arm.data.bones
+    logical = next(
+        (b for b in bones
+         if b.name.split(".")[0].split("_b")[0] == "Rotate_X"),
+        None,
+    )
+    if logical is None:
+        warn(f"barrel re-hang: {arm.name} has no Rotate_X bone; skipping")
+        return
+    trunnion_head = arm.matrix_world @ logical.head_local
+    lm = arm.matrix_world @ logical.matrix_local
+    x_axis = mathutils.Vector((lm[0][0], lm[1][0], lm[2][0])).normalized()
+
+    # Lateral offsets: from each chain's positioned bone (the logical
+    # Roll_BackN — BlendBone heads sit at the origin and are useless).
+    laterals: list[tuple[float, int]] = []
+    for num, target in sorted(barrel_chains.items()):
+        b = bones[target]
+        if b.head_local.length < 1e-3:
+            warn(f"barrel re-hang: {arm.name} chain {target!r} sits at the "
+                 f"armature origin; no usable lateral — skipping rig")
+            return
+        pos = arm.matrix_world @ b.head_local
+        laterals.append(((pos - trunnion_head).dot(x_axis), num))
+    spread = max(l for l, _ in laterals) - min(l for l, _ in laterals)
+    if spread < 1.5:
+        return
+
+    pitch_deform = next(
+        (b.name for b in bones
+         if _PITCH_DEFORM_RE.fullmatch(b.name.split(".")[0].split("_b")[0])
+         and b.name in weighted),
+        logical.name,
+    )
+
+    view = bpy.context.view_layer
+    bpy.ops.object.select_all(action="DESELECT")
+    arm.select_set(True)
+    view.objects.active = arm
+    bpy.ops.object.mode_set(mode="EDIT")
+    arm_world = arm.matrix_world.copy()
+    arm_world_inv = arm_world.inverted()
+    for lat, num in laterals:
+        name = f"Barrel{num}{suffix}"
+        eb = arm.data.edit_bones.new(name)
+        head_world = trunnion_head + lat * x_axis
+        world = _canonical_bone_matrix(
+            mathutils.Matrix.Translation(head_world) @ lm.to_3x3().to_4x4()
+        )
+        eb.matrix = arm_world_inv @ world
+        eb.length = 0.5
+        eb.parent = arm.data.edit_bones[pitch_deform]
+        arm.data.edit_bones[barrel_chains[num]].parent = eb
+        fk_records.append({"name": name, "stem": "Barrel", "weighted": True})
+        stats.barrels_created += 1
+        stats.fk_bones += 1
+    bpy.ops.object.mode_set(mode="OBJECT")
+    stats.notes.append(
+        f"{arm.name}: {len(laterals)} barrel chains re-hung on trunnion handles"
+    )
+
+
+def _split_barrel_weights(
+    arm: bpy.types.Object,
+    suffix: str,
+    fk_records: list[dict],
+    stats: SkinnedRigStats,
+    warn: Callable[[str], None],
+) -> None:
+    """Synthesize per-barrel bones on single-gun-block rigs.
+
+    WG authors many turrets with all barrels skinned to ONE pitch
+    deform bone — nothing individually rotatable. But every barrel
+    still has a ``Roll_BackN`` recoil node marking its lateral offset,
+    and the guns share one trunnion line, so: add a ``BarrelN`` bone
+    per marker on the trunnion line (child of the pitch deform bone —
+    group elevation still carries them) and move each gun-weighted
+    vertex's weight to its nearest barrel. Blast-bag blend weights ride
+    along, so each bag deforms with its own barrel.
+
+    Rigs that already deform per-barrel (weighted Roll_Back joints —
+    the Azur Baltimore mains) are skipped; so are rigs with fewer than
+    two markers or more than one weighted pitch deform bone (quads —
+    revisit when one enters the corpus).
+    """
+    # Recomputed post-rename: vertex groups were renamed with the bones.
+    weighted = _weighted_bones(arm)
+    bones = arm.data.bones
+
+    # Case B: the rig already deforms per barrel (weighted
+    # Roll_BackN_BlendBone joints — Azur Baltimore mains). Their heads
+    # sit at the MUZZLES though, and their logical Roll_BackN parents
+    # carry no weights (so the manifest would drop them) — synthesize
+    # the same BarrelN trunnion-line handles as Case A and re-hang each
+    # Roll_BackN chain under its barrel. Pure hierarchy surgery: bone
+    # worlds and weights are untouched.
+    barrel_chains: dict[int, str] = {}
+    for b in bones:
+        stem0 = b.name.split(".")[0]
+        m = re.fullmatch(r"Roll_Back(\d+)_BlendBone(_b\d+)?", stem0)
+        if not (m and b.name in weighted):
+            continue
+        num = int(m.group(1))
+        target = b.name
+        if b.parent is not None:
+            pm = _ROLLBACK_STEM_RE.fullmatch(
+                b.parent.name.split(".")[0].split("_b")[0]
+            )
+            if pm and int(pm.group(1)) == num:
+                target = b.parent.name
+        barrel_chains[num] = target
+    if len(barrel_chains) >= 2:
+        _rehang_barrel_chains(arm, suffix, barrel_chains, weighted,
+                              fk_records, stats, warn)
+        return
+
+    pitch_deform = [
+        b.name for b in bones
+        if _PITCH_DEFORM_RE.fullmatch(b.name.split(".")[0].split("_b")[0])
+        and b.name in weighted
+    ]
+    if len(pitch_deform) != 1:
+        if len(pitch_deform) > 1:
+            warn(f"barrel split: {arm.name} has {len(pitch_deform)} pitch "
+                 f"deform bones (quad?); skipping")
+        return
+    deform_name = pitch_deform[0]
+    logical = next(
+        (b for b in bones if b.name.split(".")[0].split("_b")[0] == "Rotate_X"),
+        None,
+    )
+    if logical is None:
+        return
+
+    # Barrel markers: Roll_BackN nodes anywhere under this rig.
+    markers: list[tuple[int, mathutils.Vector]] = []
+    scope = {arm.name} | {o.name for o in arm.children_recursive}
+    for o in bpy.context.scene.objects:
+        if o.name not in scope:
+            continue
+        m = _ROLLBACK_STEM_RE.fullmatch(o.name.split(".")[0].split("_b")[0])
+        if m:
+            markers.append((int(m.group(1)), o.matrix_world.translation.copy()))
+    if len(markers) < 2:
+        return
+    markers.sort()
+
+    trunnion_head = arm.matrix_world @ logical.head_local
+    lm = arm.matrix_world @ logical.matrix_local
+    x_axis = mathutils.Vector((lm[0][0], lm[1][0], lm[2][0])).normalized()
+    laterals = [( (pos - trunnion_head).dot(x_axis), num) for num, pos in markers]
+
+    # Only split guns with real lateral separation (main/secondary
+    # batteries). Small AA mounts would each sprout a cluster of
+    # near-coincident FK spheres — clutter, not posing value.
+    spread = max(l for l, _ in laterals) - min(l for l, _ in laterals)
+    if spread < 1.5:
+        return
+
+    # Bones: on the trunnion line at each barrel's lateral offset,
+    # canonical frame, child of the pitch deform bone.
+    view = bpy.context.view_layer
+    bpy.ops.object.select_all(action="DESELECT")
+    arm.select_set(True)
+    view.objects.active = arm
+    bpy.ops.object.mode_set(mode="EDIT")
+    arm_world = arm.matrix_world.copy()
+    arm_world_inv = arm_world.inverted()
+    barrel_names: list[tuple[float, str]] = []
+    for lat, num in laterals:
+        name = f"Barrel{num}{suffix}"
+        eb = arm.data.edit_bones.new(name)
+        head_world = trunnion_head + lat * x_axis
+        world = _canonical_bone_matrix(
+            mathutils.Matrix.Translation(head_world) @ lm.to_3x3().to_4x4()
+        )
+        eb.matrix = arm_world_inv @ world
+        eb.length = 0.5
+        eb.parent = arm.data.edit_bones[deform_name]
+        barrel_names.append((lat, name))
+    bpy.ops.object.mode_set(mode="OBJECT")
+
+    # Weight surgery: every vertex weighted to the pitch deform bone
+    # moves to its nearest barrel (nearest lateral offset).
+    moved = 0
+    for obj in bpy.context.scene.objects:
+        if obj.type != "MESH":
+            continue
+        if not any(m.type == "ARMATURE" and m.object == arm for m in obj.modifiers):
+            continue
+        vg_deform = obj.vertex_groups.get(deform_name)
+        if vg_deform is None:
+            continue
+        vg_barrels = {
+            name: obj.vertex_groups.new(name=name) for _lat, name in barrel_names
+        }
+        deform_idx = vg_deform.index
+        mw = obj.matrix_world
+        for v in obj.data.vertices:
+            w = None
+            for g in v.groups:
+                if g.group == deform_idx:
+                    w = g.weight
+                    break
+            if w is None or w <= 0.0:
+                continue
+            lat = ((mw @ v.co) - trunnion_head).dot(x_axis)
+            name = min(barrel_names, key=lambda ln: abs(ln[0] - lat))[1]
+            vg_barrels[name].add([v.index], w, "REPLACE")
+            vg_deform.remove([v.index])
+            moved += 1
+
+    # The Roll_Back / HP_gunFire marker Empties deliberately do NOT
+    # re-hang onto the barrel bones: they are invisible in the studio
+    # consumer and nothing reads muzzle positions there, while Blender's
+    # bone-parent frame evaluation makes a world-preserving re-parent
+    # fragile (stale pose frames scatter the markers). Revisit only if a
+    # consumer ever needs muzzle points to track individual elevation.
+
+    for _lat, name in barrel_names:
+        fk_records.append({"name": name, "stem": "Barrel", "weighted": True})
+        stats.barrels_created += 1
+        stats.fk_bones += 1
+    stats.notes.append(
+        f"{arm.name}: {len(barrel_names)} barrels split, {moved} verts moved"
+    )
+
+
 def prepare_skinned_fk(
     *, on_warning: Callable[[str], None] | None = None,
 ) -> SkinnedRigStats:
@@ -115,6 +360,21 @@ def prepare_skinned_fk(
     armatures = [o for o in bpy.context.scene.objects if o.type == "ARMATURE"]
     for idx, arm in enumerate(armatures):
         stats.armatures += 1
+
+        # Demote natively BONE-parented children (Roll_Back / HP_gunFire
+        # markers, rigid meshes) to plain object parenting FIRST, while
+        # the bone frames are still original: re-orienting a bone's rest
+        # below would otherwise swing these children around the bone
+        # head. World transforms preserved; markers become static
+        # (cosmetic, invisible in the studio consumer).
+        for child in list(arm.children):
+            if child.parent_type == "BONE":
+                wm = child.matrix_world.copy()
+                child.parent_type = "OBJECT"
+                child.parent_bone = ""
+                child.matrix_parent_inverse = mathutils.Matrix.Identity(4)
+                child.matrix_world = wm
+
         weighted = _weighted_bones(arm)
         # "_bNNN" — never collides with Blender's ".NNN" object dedup, so
         # bone names stay scene-unique against armature-OBJECT names too.
@@ -183,11 +443,13 @@ def prepare_skinned_fk(
                 })
         bpy.ops.object.mode_set(mode="OBJECT")
 
-        arm[FK_BONES_PROP] = json.dumps(fk_records)
         stats.fk_bones += len(fk_records)
+        _split_barrel_weights(arm, suffix, fk_records, stats, warn)
+        arm[FK_BONES_PROP] = json.dumps(fk_records)
 
     # --- attachments ride the node their p1 hash names -------------------
     name_hash_cache: dict[str, int] = {}
+    bone_rehangs: list[tuple[bpy.types.Object, mathutils.Matrix]] = []
 
     def nh(name: str) -> int:
         h = name_hash_cache.get(name)
@@ -235,12 +497,26 @@ def prepare_skinned_fk(
                         obj.parent_type = "BONE"
                         obj.parent_bone = bone.name
                         obj.matrix_parent_inverse = mathutils.Matrix.Identity(4)
-                        obj.matrix_world = mw
+                        bone_rehangs.append((obj, mw))
                         stats.attachments_rehung += 1
                         done = True
                         break
             if done:
                 break
+
+    # Bone-parented re-hangs: restore world via an evaluated-basis
+    # correction. Assigning matrix_world straight after a bone-parent
+    # change evaluates against a stale/convention-dependent frame and
+    # scatters the object; instead let the depsgraph settle, then solve
+    # basis_new = basis_old @ current_world⁻¹ @ target_world (exact for
+    # any parent frame, tail conventions included).
+    if bone_rehangs:
+        bpy.context.view_layer.update()
+        for obj, wm in bone_rehangs:
+            obj.matrix_basis = (
+                obj.matrix_basis @ obj.matrix_world.inverted() @ wm
+            )
+        bpy.context.view_layer.update()
 
     return stats
 
