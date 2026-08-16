@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import struct
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -126,6 +127,106 @@ def _import_glb(glb_path: Path) -> list[bpy.types.Object]:
     after = set(bpy.context.scene.objects)
     new = list(after - before)
     return [obj for obj in new if obj.parent not in new]
+
+
+def _glb_mesh_node_names(glb_path: Path) -> list[tuple[str, int]]:
+    """``(node_name, vertex_count)`` for every mesh-bearing GLB node.
+
+    Pure-stdlib GLB header walk (the JSON chunk is always first); vertex
+    count is the summed POSITION accessor count over the mesh's
+    primitives. Used only to repair Blender's 63-char name truncation,
+    so a malformed file degrades to "no repairs", never to a failure.
+    """
+    try:
+        with open(glb_path, "rb") as f:
+            if f.read(4) != b"glTF":
+                return []
+            f.read(8)  # version + total length
+            chunk_len, chunk_type = struct.unpack("<2I", f.read(8))
+            if chunk_type != 0x4E4F534A:  # 'JSON'
+                return []
+            doc = json.loads(f.read(chunk_len))
+    except (OSError, ValueError, struct.error):
+        return []
+    accessors = doc.get("accessors") or []
+    meshes = doc.get("meshes") or []
+    out: list[tuple[str, int]] = []
+    for node in doc.get("nodes") or []:
+        mi = node.get("mesh")
+        if mi is None or not (0 <= mi < len(meshes)):
+            continue
+        name = node.get("name") or meshes[mi].get("name") or ""
+        verts = 0
+        for prim in meshes[mi].get("primitives") or []:
+            ai = (prim.get("attributes") or {}).get("POSITION")
+            if ai is not None and 0 <= ai < len(accessors):
+                verts += int(accessors[ai].get("count") or 0)
+        if name:
+            out.append((name, verts))
+    return out
+
+
+#: Blender clamps datablock names to 63 bytes; colliding truncations get
+#: the base cut to 59 to fit a ``.NNN`` suffix.
+_BL_NAME_MAX = 63
+_BL_NAME_SUFFIXED_MAX = 59
+
+
+def _repair_truncated_names(
+    roots: list[bpy.types.Object], glb_path: Path,
+) -> int:
+    """Undo Blender's 63-char truncation of long hull node names.
+
+    ``<Model>_<Section> / <Mesh>`` node names routinely exceed Blender's
+    63-byte limit for the crack / patch-wire LOD variants — truncation
+    eats the ``_lodN`` suffix and colliding stems gain ``.NNN``, so the
+    LOD/damage filters see e.g. four "identical" lod0 cracks stacked in
+    place. Match each truncated object back to the GLB's real node names
+    (unique-prefix first, vertex-count rank inside ambiguous clusters)
+    and rename it to the node's MESH part, which always fits.
+
+    Returns the number of objects renamed.
+    """
+    fulls = [(n, v) for n, v in _glb_mesh_node_names(glb_path)
+             if len(n) > _BL_NAME_MAX]
+    if not fulls:
+        return 0
+    mesh_objs: list[bpy.types.Object] = []
+    for r in roots:
+        for o in (r, *r.children_recursive):
+            if o.type == "MESH":
+                mesh_objs.append(o)
+
+    # Cluster on the shortest surviving prefix so the 63-char first copy
+    # and its 59-char ``.NNN`` siblings land in the same bucket.
+    clusters: dict[str, list[tuple[str, int]]] = {}
+    for n, v in fulls:
+        clusters.setdefault(n[:_BL_NAME_SUFFIXED_MAX], []).append((n, v))
+
+    repaired = 0
+    for key, cands in clusters.items():
+        suspects = [
+            o for o in mesh_objs
+            if len(o.name.split(".")[0]) >= _BL_NAME_SUFFIXED_MAX
+            and o.name[:_BL_NAME_SUFFIXED_MAX] == key
+        ]
+        if not suspects:
+            continue
+        if len(suspects) != len(cands):
+            logger.warning(
+                "name repair: cluster %r has %d objects vs %d GLB nodes; "
+                "pairing best-effort", key, len(suspects), len(cands),
+            )
+        # LODs shrink monotonically, so vertex-count rank pairs them even
+        # if Blender's import dedup nudged the absolute counts.
+        suspects.sort(key=lambda o: len(o.data.vertices), reverse=True)
+        ordered = sorted(cands, key=lambda nv: nv[1], reverse=True)
+        for obj, (full, _v) in zip(suspects, ordered):
+            new = short_mesh_name(full)
+            if obj.name != new:
+                obj.name = new
+                repaired += 1
+    return repaired
 
 
 def _strip_overlay_groups(roots: list[bpy.types.Object]) -> list[bpy.types.Object]:
@@ -325,6 +426,10 @@ def _instantiate_attachments(
         child_root["wows_asset_id"] = child_id
         child_root["wows_attached_placement_id"] = pid
         child_root["wows_attached_to"] = host_root.name
+        # Murmur3_32(seed=0) of the host-model node this attachment is
+        # authored on ("Rotate_Y" for turret-roof gear) — lets the pivot
+        # rig re-hang it so it rides the yaw.
+        child_root["wows_attached_p1_hash"] = str(att.get("p1_hash") or "")
         attached += 1
 
     return attached, filtered
@@ -767,6 +872,9 @@ def build_ship(
 
     # Hull.
     hull_objs = _import_glb(hull_glb)
+    repaired = _repair_truncated_names(hull_objs, hull_glb)
+    if repaired:
+        logger.info("repaired %d truncated hull mesh names", repaired)
     hull_root = bpy.data.objects.new(f"{sidecar.ship_name}_hull", None)
     hull_root.empty_display_type = "PLAIN_AXES"
     bpy.context.scene.collection.objects.link(hull_root)

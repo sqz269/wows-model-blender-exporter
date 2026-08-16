@@ -68,8 +68,34 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--damage-variants", action="store_true",
                     help="Keep the broken-seam crack meshes too (the intact "
                          "seam patches are always kept).")
+    ap.add_argument("--wreck-segments", action="store_true",
+                    help="Export the ship as separated wreck pieces: one "
+                         "top-level seg_<Section> root per hull section "
+                         "(Bow/MidFront/MidBack/Stern), torn crack faces "
+                         "shown, intact seam patches removed, and every "
+                         "placement re-hung on its parent section. All "
+                         "segments share the ship origin, so spawning them "
+                         "at one position reassembles the broken ship. "
+                         "Implies --damage-variants.")
     ap.add_argument("--overlays", action="store_true",
                     help="Keep the Armor / Hitboxes collision volumes.")
+    ap.add_argument("--pivot-rig", action="store_true",
+                    help="Convert accessory armatures (turret yaw / gun "
+                         "pitch / recoil bones) into plain pivot transform "
+                         "hierarchies with rigidly-bound meshes: identical "
+                         "at rest, survives static importers, and pose "
+                         "tools can rotate the named Rotate_Y / Rotate_X "
+                         "nodes. Default in --wreck-segments mode unless "
+                         "--skinned-fk is given.")
+    ap.add_argument("--skinned-fk", action="store_true",
+                    help="Keep accessory armatures SKINNED (consumer must "
+                         "import with the rig intact, e.g. Unity Generic): "
+                         "soft-weighted parts (gun blast bags) deform when "
+                         "posed instead of creasing. Bones are renamed "
+                         "scene-unique, FK bone rest frames canonicalized, "
+                         "and a <out>.fk_bones.json manifest written for "
+                         "studio bone-list generation. Supersedes "
+                         "--pivot-rig.")
     ap.add_argument("--combine", action="store_true",
                     help="Static-bake, dedup materials by (class, texture "
                          "set), and join meshes per material — ~6.5x fewer "
@@ -175,7 +201,7 @@ def main() -> int:
             skin_id=args.skin,
             exterior_id=args.exterior or None,
             lod_policy=args.lod,
-            damage_variants=args.damage_variants,
+            damage_variants=args.damage_variants or args.wreck_segments,
             overlays=args.overlays,
             # Delete rather than hide: "hidden" is not a concept every
             # DCC honours on FBX import, so filtered geometry must not
@@ -193,12 +219,63 @@ def main() -> int:
 
     print(f"built {result.summary()}")
 
+    wreck_stats = None
+    if args.wreck_segments:
+        from wows_blender.wreck import split_wreck_segments
+
+        try:
+            wreck_stats = split_wreck_segments(
+                result.root,
+                on_warning=lambda m: print(f"warn: {m}", file=sys.stderr),
+            )
+        except RuntimeError as e:
+            print(f"error: {e}", file=sys.stderr)
+            return EXIT_FAILED
+        result.root = None  # the ship root is gone; segments own the scene
+        print(f"wreck: {wreck_stats.summary()}")
+
+    pivot_stats = None
+    skinned_stats = None
+    if args.skinned_fk:
+        from wows_blender.skinned_rig import prepare_skinned_fk
+
+        skinned_stats = prepare_skinned_fk(
+            on_warning=lambda m: print(f"warn: {m}", file=sys.stderr),
+        )
+        print(f"skinned fk: {skinned_stats.summary()}")
+        from wows_blender.wreck import unparent_deformed_from_rigs
+
+        moved = unparent_deformed_from_rigs()
+        print(f"skinned fk: {moved} deformed meshes unparented from rigs")
+    elif args.pivot_rig or args.wreck_segments:
+        from wows_blender.pivot_rig import armatures_to_pivots
+
+        pivot_stats = armatures_to_pivots(
+            on_warning=lambda m: print(f"warn: {m}", file=sys.stderr),
+        )
+        print(f"pivot rig: {pivot_stats.summary()}")
+
     combine_stats = None
     if args.combine:
         from wows_blender.combine import combine_for_export
 
-        combine_stats = combine_for_export()
+        combine_stats = combine_for_export(
+            per_segment=args.wreck_segments,
+            keep_skinned=args.skinned_fk,
+        )
         print(f"combine: {combine_stats.summary()}")
+
+    if args.wreck_segments:
+        # Safety net: the rig passes and combine's scaffolding purge can
+        # orphan bone-riding meshes to the scene root, where a
+        # segment-wise consumer prunes them. Runs after every mutating
+        # pass so any stray is caught.
+        from wows_blender.wreck import rehome_strays
+
+        rehomed = rehome_strays(
+            on_warning=lambda m: print(f"warn: {m}", file=sys.stderr),
+        )
+        print(f"wreck rehome: {rehomed} strays re-hung")
 
     counts = PrepCounts()
     if not args.no_materials:
@@ -247,6 +324,13 @@ def main() -> int:
         print(f"error: FBX export failed: {type(e).__name__}: {e}", file=sys.stderr)
         return EXIT_FAILED
 
+    if args.skinned_fk:
+        from wows_blender.skinned_rig import write_fk_manifest
+
+        fk_path = args.out.with_suffix(".fk_bones.json")
+        n_fk = write_fk_manifest(fk_path)
+        print(f"fk manifest: {n_fk} handles -> {fk_path}")
+
     manifest_path = args.manifest or args.out.with_suffix(".materials.json")
     try:
         n = write_material_manifest(
@@ -288,6 +372,26 @@ def main() -> int:
                 "materials_out": combine_stats.materials_out,
             }
             if combine_stats is not None else None
+        ),
+        "wreck_segments": (
+            {
+                s: {
+                    "hull_meshes": wreck_stats.hull_meshes.get(s, 0),
+                    "placements": wreck_stats.placements.get(s, 0),
+                }
+                for s in wreck_stats.sections
+            }
+            if wreck_stats is not None else None
+        ),
+        "pivot_rig": (
+            {
+                "armatures": pivot_stats.armatures,
+                "bone_pivots": pivot_stats.bone_pivots,
+                "meshes_split": pivot_stats.meshes_split,
+                "pieces": pivot_stats.pieces,
+                "attachments_rehung": pivot_stats.attachments_rehung,
+            }
+            if pivot_stats is not None else None
         ),
         "prep": {
             "materials":  counts.materials,
