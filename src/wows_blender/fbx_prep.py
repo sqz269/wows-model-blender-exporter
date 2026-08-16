@@ -395,6 +395,168 @@ def bake_base_color(
     return counts
 
 
+def bake_camo_mgn_mr(
+    out_dir: Path,
+    *,
+    size: int = 2048,
+    counts: PrepCounts | None = None,
+) -> PrepCounts:
+    """EMIT-bake the camo-MGN-blended metallic/roughness for skins that
+    override the surface response (``mgn_influence`` metal/gloss > 0).
+
+    The Path B camo nodes fold ``camoMGN.rg`` into the Metallic /
+    Roughness chains, but FBX carries one packed ``_mr`` image per
+    material — without this bake the prep pass rewires MR straight back
+    to the base image and a polished-metal skin (Ranked gold/silver/
+    bronze) exports matte. Bakes the final BSDF Metallic/Roughness
+    inputs into a glTF-layout image (G=roughness, B=metallic) and swaps
+    it onto the material's ``WoWS_metallicRoughness`` node IN PLACE, so
+    prep, the manifest and the uMG repack consume it unchanged.
+
+    Must run AFTER :func:`bake_base_color` (shares its scene bake
+    settings) and BEFORE :func:`prep_all_materials`.
+    """
+    counts = counts or PrepCounts()
+    targets: dict[str, tuple[bpy.types.Material, bpy.types.Image, bpy.types.Node]] = {}
+    mats = [
+        m for m in scene_materials()
+        if m.use_nodes
+        and (inf := m.get("wows_camo_mgn_influence")) is not None
+        and (float(inf[0]) > 0.0 or float(inf[1]) > 0.0)
+    ]
+    if not mats:
+        return counts
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    scene = bpy.context.scene
+    prev_engine = scene.render.engine
+    scene.render.engine = "CYCLES"
+    scene.cycles.samples = 1
+    scene.cycles.use_denoising = False
+    scene.render.bake.margin = 4096
+    scene.render.bake.margin_type = "EXTEND"
+    scene.render.bake.use_clear = False
+
+    # Rig every target material for the EMIT pass: pack the FINAL
+    # Metallic/Roughness inputs (camo mixes included) into an emission
+    # colour, temporarily routed to the Material Output.
+    restore: list[tuple[bpy.types.Material, list[bpy.types.Node], object]] = []
+    for mat in mats:
+        bsdf = _principled(mat)
+        nt = mat.node_tree
+        out_node = next((n for n in nt.nodes if n.type == "OUTPUT_MATERIAL" and n.is_active_output), None)
+        if bsdf is None or out_node is None:
+            continue
+        surf = out_node.inputs["Surface"]
+        prev_src = surf.links[0].from_socket if surf.links else None
+
+        combine = nt.nodes.new("ShaderNodeCombineColor")
+        combine.name = "WoWS_mgn_mr_pack"
+        combine.location = (900, -1900)
+        combine.inputs["Red"].default_value = 0.0
+        for channel, sock_name in (("Green", "Roughness"), ("Blue", "Metallic")):
+            sock = _socket(bsdf, sock_name)
+            if sock is None:
+                continue
+            if sock.links:
+                nt.links.new(sock.links[0].from_socket, combine.inputs[channel])
+            else:
+                combine.inputs[channel].default_value = float(sock.default_value)
+        emit = nt.nodes.new("ShaderNodeEmission")
+        emit.name = "WoWS_mgn_mr_emit"
+        emit.location = (1150, -1900)
+        nt.links.new(combine.outputs["Color"], emit.inputs["Color"])
+        for link in list(nt.links):
+            if link.to_socket == surf:
+                nt.links.remove(link)
+        nt.links.new(emit.outputs["Emission"], surf)
+
+        mr_size = _bake_size_for(mat, size)
+        img = bpy.data.images.new(
+            f"{mat.name}_mrbaked", width=mr_size, height=mr_size, alpha=False,
+        )
+        img.colorspace_settings.name = "Non-Color"
+        node = nt.nodes.new("ShaderNodeTexImage")
+        node.image = img
+        node.name = "WoWS_fbx_mrbake_target"
+        node.location = (1150, -2150)
+        node.select = True
+        nt.nodes.active = node
+        targets[mat.name] = (mat, img, node)
+        restore.append((mat, [combine, emit, node], prev_src))
+
+    if not targets:
+        scene.render.engine = prev_engine
+        return counts
+
+    target_names = set(targets)
+    for obj in bpy.context.selected_objects:
+        obj.select_set(False)
+    picked = 0
+    for obj in _mesh_objects(None):
+        if not obj.data.uv_layers:
+            continue
+        mats_of = [s.material.name for s in obj.material_slots if s.material]
+        if mats_of and all(n in target_names for n in mats_of):
+            obj.select_set(True)
+            picked += 1
+    ok = picked > 0
+    if ok:
+        bpy.context.view_layer.objects.active = next(
+            o for o in bpy.context.selected_objects
+        )
+        try:
+            bpy.ops.object.bake(type="EMIT")
+        except RuntimeError as e:
+            counts.notes.append(f"mgn mr bake failed: {e}")
+            logger.warning("mgn mr bake failed: %s", e)
+            ok = False
+
+    for mat, scaffolding, prev_src in restore:
+        nt = mat.node_tree
+        out_node = next((n for n in nt.nodes if n.type == "OUTPUT_MATERIAL" and n.is_active_output), None)
+        if out_node is not None:
+            surf = out_node.inputs["Surface"]
+            for link in list(nt.links):
+                if link.to_socket == surf:
+                    nt.links.remove(link)
+            if prev_src is not None:
+                nt.links.new(prev_src, surf)
+        if ok and mat.name in targets:
+            _mat, img, _node = targets[mat.name]
+            path = out_dir / f"{_safe_name(mat.name)}_mrbaked.png"
+            img.filepath_raw = str(path)
+            img.file_format = "PNG"
+            try:
+                img.save()
+            except RuntimeError as e:
+                counts.notes.append(f"mgn mr bake save failed for {mat.name}: {e}")
+            else:
+                # Swap the baked MR onto the material's existing packed-MR
+                # node IN PLACE — prep/manifest/repack read it unchanged.
+                mr_node = _node_or_new_teximage(mat, "WoWS_metallicRoughness")
+                mr_node.image = img
+                mat["wows_mgn_mr_baked"] = True
+                counts.notes.append(f"mgn mr baked: {mat.name}")
+        for n in scaffolding:
+            try:
+                nt.nodes.remove(n)
+            except (ReferenceError, RuntimeError):
+                pass
+
+    scene.render.engine = prev_engine
+    return counts
+
+
+def _node_or_new_teximage(mat: bpy.types.Material, name: str) -> bpy.types.Node:
+    node = mat.node_tree.nodes.get(name)
+    if node is None or node.bl_idname != "ShaderNodeTexImage":
+        node = mat.node_tree.nodes.new("ShaderNodeTexImage")
+        node.name = name
+        node.location = (-600, -400)
+    return node
+
+
 def _safe_name(name: str) -> str:
     return "".join(c if c.isalnum() or c in "-_." else "_" for c in name)
 

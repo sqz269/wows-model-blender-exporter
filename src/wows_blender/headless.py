@@ -291,6 +291,12 @@ def main() -> int:
                 result.root if combine_stats is None else None,
                 bake_dir, size=args.bake_size, counts=counts,
             )
+            # Metal-finish skins (camo MGN with nonzero metal/gloss
+            # influence) also need their blended metallic/roughness
+            # flattened — FBX carries one packed _mr per material.
+            from wows_blender.fbx_prep import bake_camo_mgn_mr
+
+            counts = bake_camo_mgn_mr(bake_dir, size=args.bake_size, counts=counts)
             for note in counts.notes:
                 print(f"warn: {note}", file=sys.stderr)
         before = len(counts.notes)
