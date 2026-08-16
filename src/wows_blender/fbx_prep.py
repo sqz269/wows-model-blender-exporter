@@ -307,6 +307,16 @@ def bake_base_color(
         intent = str(mat.get("wows_shader_intent") or "").lower()
         if "cutout" in intent or "transparent" in intent:
             continue
+        # SELECTIVE BAKE: only materials carrying a camo composite need
+        # flattening — their paint is a node graph no FBX slot can
+        # express. Everything else (bespoke exterior hulls, plain parts)
+        # already has its final albedo as ONE image; baking would merely
+        # resample it, and on segment-heavy wreck scenes the 4096 hull
+        # bake silently came back mostly unbaked (margin-flood flats) —
+        # binding the source image sidesteps that entire failure mode
+        # and keeps intact/wreck exports pixel-identical by construction.
+        if not mat.get("wows_camo_path"):
+            continue
         mat_size = _bake_size_for(mat, size)
         img = bpy.data.images.new(
             f"{mat.name}_baked", width=mat_size, height=mat_size, alpha=True,
