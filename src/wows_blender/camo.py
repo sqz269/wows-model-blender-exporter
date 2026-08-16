@@ -16,7 +16,8 @@ Path A (palette hull tint), from the webview GLSL:
     step2   = lerp(step1, P2, mask.g)
     step3   = lerp(step2, P3, mask.b)
     final   = lerp(baseRgb, step3, mg.B)              # mg.B = camoExclusion.R
-mask is sampled at vMapUv * uv.scale + uv.offset; mask.a is unused.
+mask is sampled at rot(vMapUv) * uv.scale + uv.offset (rotate about the
+tile center first); mask.a is unused.
 """
 from __future__ import annotations
 
@@ -140,6 +141,8 @@ class PathAResolved:
     uv_offset:   tuple[float, float]
     colors:      tuple[tuple[float, float, float, float], ...]
     source:      str  # "category" (Step 1) | "per_stem" (Step 2) | "none"
+    # Radians about UV center (0.5, 0.5), applied BEFORE scale+offset.
+    uv_rotate:   float = 0.0
 
 
 def resolve_path_a(
@@ -173,7 +176,8 @@ def resolve_path_a(
     if cat is not None and cat.mask and not cat.mgn:
         png = resolve_camo_png(publish_root, cat.mask)
         if png is not None:
-            return PathAResolved(category, png, cat.uv_scale, cat.uv_offset, colors, "category")
+            return PathAResolved(category, png, cat.uv_scale, cat.uv_offset, colors,
+                                 "category", uv_rotate=cat.uv_rotate)
 
     # Step 2: per-stem cascade — texture_sets[scheme_key].baseColor.
     # Ship-local (no libraries/ prefix); resolve_camo_png handles the
@@ -200,6 +204,7 @@ class PathBResolved:
     mgn_png:   Path | None
     uv_scale:  tuple[float, float]
     uv_offset: tuple[float, float]
+    uv_rotate: float = 0.0  # radians about (0.5, 0.5), pre-scale/offset
 
 
 def resolve_path_b(
@@ -234,13 +239,15 @@ def resolve_path_b(
     if albedo is None:
         albedo = resolve_camo_png(model_root, mt.albedo)
     if albedo is None:
-        return PathBResolved(category, None, None, mt.uv_scale, mt.uv_offset)
+        return PathBResolved(category, None, None, mt.uv_scale, mt.uv_offset,
+                             uv_rotate=mt.uv_rotate)
 
     mgn = None
     if mt.mgn:
         mgn = resolve_camo_png(publish_root, mt.mgn) or resolve_camo_png(model_root, mt.mgn)
 
-    return PathBResolved(category, albedo, mgn, mt.uv_scale, mt.uv_offset)
+    return PathBResolved(category, albedo, mgn, mt.uv_scale, mt.uv_offset,
+                         uv_rotate=mt.uv_rotate)
 
 
 __all__ = [

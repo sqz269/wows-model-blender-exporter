@@ -130,14 +130,21 @@ def _uv_mapped_texture(
     *,
     uv_scale: tuple[float, float],
     uv_offset: tuple[float, float],
+    uv_rotate: float = 0.0,
     location: tuple[int, int],
     name: str,
 ) -> bpy.types.Node:
-    """Image texture sampled at ``vMapUv * scale + offset``.
+    """Image texture sampled at ``rot(vMapUv) * scale + offset``.
 
-    The Mapping node is only inserted when the transform is non-identity —
-    an identity Mapping is pure overhead and makes the graph harder for
-    the FBX prep pass to read.
+    ``uv_rotate`` (radians) spins the UV about the tile center (0.5, 0.5)
+    BEFORE scale+offset — the engine's camoRepeatsRotate order. A Vector
+    Rotate node (not the Mapping node's own rotation) because the Mapping
+    node applies scale before rotation, which diverges under non-uniform
+    scale.
+
+    Transform nodes are only inserted when non-identity — an identity
+    Mapping is pure overhead and makes the graph harder for the FBX prep
+    pass to read.
     """
     nt = mat.node_tree
     tex = nt.nodes.new("ShaderNodeTexImage")
@@ -146,21 +153,35 @@ def _uv_mapped_texture(
     tex.name = name
     tex.label = name.replace("WoWS_camo_", "camo ")
 
-    if uv_scale == (1.0, 1.0) and uv_offset == (0.0, 0.0):
+    identity_so = uv_scale == (1.0, 1.0) and uv_offset == (0.0, 0.0)
+    if identity_so and uv_rotate == 0.0:
         return tex
-
-    mapping = nt.nodes.new("ShaderNodeMapping")
-    mapping.location = (location[0] - 300, location[1])
-    mapping.name = f"{name}_mapping"
-    mapping.inputs["Scale"].default_value = (uv_scale[0], uv_scale[1], 1.0)
-    mapping.inputs["Location"].default_value = (uv_offset[0], uv_offset[1], 0.0)
 
     texcoord = nt.nodes.new("ShaderNodeTexCoord")
     texcoord.location = (location[0] - 500, location[1])
     texcoord.name = f"{name}_texcoord"
+    vec_out = texcoord.outputs["UV"]
 
-    nt.links.new(texcoord.outputs["UV"], mapping.inputs["Vector"])
-    nt.links.new(mapping.outputs["Vector"], tex.inputs["Vector"])
+    if uv_rotate != 0.0:
+        rot = nt.nodes.new("ShaderNodeVectorRotate")
+        rot.rotation_type = "Z_AXIS"
+        rot.location = (location[0] - 400, location[1])
+        rot.name = f"{name}_rotate"
+        rot.inputs["Center"].default_value = (0.5, 0.5, 0.0)
+        rot.inputs["Angle"].default_value = uv_rotate
+        nt.links.new(vec_out, rot.inputs["Vector"])
+        vec_out = rot.outputs["Vector"]
+
+    if not identity_so:
+        mapping = nt.nodes.new("ShaderNodeMapping")
+        mapping.location = (location[0] - 300, location[1])
+        mapping.name = f"{name}_mapping"
+        mapping.inputs["Scale"].default_value = (uv_scale[0], uv_scale[1], 1.0)
+        mapping.inputs["Location"].default_value = (uv_offset[0], uv_offset[1], 0.0)
+        nt.links.new(vec_out, mapping.inputs["Vector"])
+        vec_out = mapping.outputs["Vector"]
+
+    nt.links.new(vec_out, tex.inputs["Vector"])
     return tex
 
 
@@ -295,6 +316,7 @@ def apply_path_b(
     tex = _uv_mapped_texture(
         mat, img,
         uv_scale=resolved.uv_scale, uv_offset=resolved.uv_offset,
+        uv_rotate=resolved.uv_rotate,
         location=(_X0 + 900, _Y0), name="WoWS_camo_matAlbedo",
     )
 
@@ -396,22 +418,23 @@ def apply_path_b(
             nt.links.remove(link)
     nt.links.new(f_out, sink)
 
-    # ---- MGN override: camo metal/gloss folded into the MR chain ------
-    # camoMGN packs R=gloss, G=metallic (B/A = normals, not consumed
-    # here); mgn_influence = [metal, gloss, normal] mixes
+    # ---- MGN override: camo metal/gloss/normal folded into the chain --
+    # camoMGN packs R=gloss, G=metallic, B=nx, A=ny (.ba swizzle, NOT
+    # .ab — axis probe, project_camo_mgn_axis_resolution);
+    # mgn_influence = [metal, gloss, normal] mixes
     # (ship_camo_mgn_material.fx cb mgnInfluence.xyz — .w is dead).
     # Weighted by the SAME per-texel blend factor `t` the albedo uses,
     # so the surface response changes exactly where the paint lands.
-    # Normal override (.z) is not wired — ≤0.1 on every skin shipped so
-    # far except mat_HW2023 (0.9); revisit if that ships.
     inf = params.get("mgn_influence") or (0.0, 0.0, 0.0)
     inf_m, inf_g = float(inf[0]), float(inf[1])
-    if resolved.mgn_png is not None and (inf_m > 0.0 or inf_g > 0.0):
+    inf_n = float(inf[2]) if len(inf) > 2 else 0.0
+    if resolved.mgn_png is not None and (inf_m > 0.0 or inf_g > 0.0 or inf_n > 0.0):
         mgn_img = load_image(resolved.mgn_png, colorspace="Non-Color")
         if mgn_img is not None:
             mgn_tex = _uv_mapped_texture(
                 mat, mgn_img,
                 uv_scale=resolved.uv_scale, uv_offset=resolved.uv_offset,
+                uv_rotate=resolved.uv_rotate,
                 location=(_X0 + 900, _Y0 - 1400), name="WoWS_camo_mgn",
             )
             sep = nt.nodes.new("ShaderNodeSeparateColor")
@@ -445,7 +468,64 @@ def apply_path_b(
                     nt, rough_sink, rough.outputs[0], w_g.outputs[0],
                     "WoWS_camo_mgnRoughMix", (_X0 + 1800, _Y0 - 1550),
                 )
-            mat["wows_camo_mgn_influence"] = [inf_m, inf_g, float(inf[2] if len(inf) > 2 else 0.0)]
+            # Normal leg: splice a mix in front of the Normal Map node's
+            # Color input. camoMGN.B → encoded nx, tex Alpha → encoded ny,
+            # flat-Z blue; the Normal Map node renormalizes post-mix.
+            # Render-graph only — the FBX prep pass rewires the normal
+            # slot by node name, so exports keep the plain base normal
+            # (normals are not baked).
+            norm_node = nt.nodes.get("WoWS_normal_map")
+            if inf_n > 0.0 and norm_node is not None:
+                comb = nt.nodes.new("ShaderNodeCombineColor")
+                comb.name = "WoWS_camo_mgnNormCombine"
+                comb.location = (_X0 + 1500, _Y0 - 1950)
+                nt.links.new(sep.outputs["Blue"], comb.inputs["Red"])
+                nt.links.new(mgn_tex.outputs["Alpha"], comb.inputs["Green"])
+                comb.inputs["Blue"].default_value = 1.0
+                if cat_paint is not None:
+                    w_n = _math(nt, "MULTIPLY", (_X0 + 1500, _Y0 - 1850),
+                                "WoWS_camo_mgnWn", a=cat_paint, bv=inf_n)
+                else:
+                    w_n = _math(nt, "MULTIPLY", (_X0 + 1500, _Y0 - 1850),
+                                "WoWS_camo_mgnWn", av=1.0, bv=inf_n)
+                nmix, n_fac, n_a, n_b, n_out = _new_mix(
+                    nt, location=(_X0 + 1800, _Y0 - 1950),
+                    name="WoWS_camo_mgnNormMix",
+                )
+                color_in = norm_node.inputs["Color"]
+                prev = color_in.links[0].from_socket if color_in.links else None
+                if prev is not None:
+                    nt.links.new(prev, n_a)
+                else:
+                    n_a.default_value = (0.5, 0.5, 1.0, 1.0)
+                nt.links.new(comb.outputs["Color"], n_b)
+                nt.links.new(w_n.outputs[0], n_fac)
+                for link in list(color_in.links):
+                    nt.links.remove(link)
+                nt.links.new(n_out, color_in)
+            mat["wows_camo_mgn_influence"] = [inf_m, inf_g, inf_n]
+
+    # ---- Static camo-emission term (chunk024 i216) --------------------
+    # coverage·albedo·basePower fed to the Principled Emission inputs.
+    # The ANIMATED term (camoEmission anim modes, driven by g_time) has
+    # no meaning in a static build; the base glow is what a still render
+    # can carry. Render-graph only — the FBX prep pass rewires by node
+    # name and drops this mix, so exports are unchanged.
+    base_power = float(params.get("emission_base_power", 0.0) or 0.0)
+    if base_power > 0.0:
+        em_col = bsdf.inputs.get("Emission Color")
+        em_str = bsdf.inputs.get("Emission Strength")
+        if em_col is not None and em_str is not None:
+            emix, e_fac, e_a, e_b, e_out = _new_mix(
+                nt, location=(_X0 + 1800, _Y0 - 2150),
+                name="WoWS_camo_emisStatic",
+            )
+            emix.blend_type = "MULTIPLY"
+            e_fac.default_value = 1.0
+            nt.links.new(tex.outputs["Color"], e_a)
+            nt.links.new(coverage, e_b)
+            nt.links.new(e_out, em_col)
+            em_str.default_value = base_power
 
     mat["wows_camo_path"] = "B"
     mat["wows_camo_category"] = resolved.category
@@ -556,6 +636,7 @@ def apply_path_a(
     mask_tex = _uv_mapped_texture(
         mat, mask_img,
         uv_scale=resolved.uv_scale, uv_offset=resolved.uv_offset,
+        uv_rotate=resolved.uv_rotate,
         location=(_X0 + 900, _Y0 - 1000), name="WoWS_camo_mask",
     )
     mask_sep = nt.nodes.new("ShaderNodeSeparateColor")

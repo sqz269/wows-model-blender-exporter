@@ -102,6 +102,9 @@ class CamoCategory:
     mgn:       tuple[str, ...] = ()   # Path B mgn dds_mips
     uv_scale:  tuple[float, float] = (1.0, 1.0)
     uv_offset: tuple[float, float] = (0.0, 0.0)
+    # Radians about UV center (0.5, 0.5), applied BEFORE scale+offset
+    # (engine camoRepeatsRotate order). Absent on pre-2026-08 sidecars.
+    uv_rotate: float = 0.0
     params:    dict[str, Any] = field(default_factory=dict)
 
 
@@ -114,6 +117,7 @@ class MatTexture:
     mgn:       tuple[str, ...] = ()
     uv_scale:  tuple[float, float] = (1.0, 1.0)
     uv_offset: tuple[float, float] = (0.0, 0.0)
+    uv_rotate: float = 0.0            # radians about (0.5, 0.5), pre-scale/offset
     params:    dict[str, Any] = field(default_factory=dict)
 
 
@@ -470,7 +474,7 @@ def _mips(raw: Any) -> tuple[str, ...]:
     return tuple(str(x) for x in m)
 
 
-def _uv(raw: Any) -> tuple[tuple[float, float], tuple[float, float]]:
+def _uv(raw: Any) -> tuple[tuple[float, float], tuple[float, float], float]:
     uv = raw.get("uv") if isinstance(raw, dict) else None
     uv = uv or {}
     scale = uv.get("scale") or (1.0, 1.0)
@@ -478,6 +482,7 @@ def _uv(raw: Any) -> tuple[tuple[float, float], tuple[float, float]]:
     return (
         (float(scale[0]), float(scale[1])),
         (float(offset[0]), float(offset[1])),
+        float(uv.get("rotate") or 0.0),
     )
 
 
@@ -495,23 +500,25 @@ def _coerce_color_scheme(raw: Any) -> ColorScheme | None:
 
 
 def _coerce_camo_category(raw: dict[str, Any]) -> CamoCategory:
-    scale, offset = _uv(raw)
+    scale, offset, rotate = _uv(raw)
     return CamoCategory(
         mask=_mips(raw.get("mask")),
         mgn=_mips(raw.get("mgn")),
         uv_scale=scale,
         uv_offset=offset,
+        uv_rotate=rotate,
         params=dict(raw.get("params") or {}),
     )
 
 
 def _coerce_mat_texture(raw: dict[str, Any]) -> MatTexture:
-    scale, offset = _uv(raw)
+    scale, offset, rotate = _uv(raw)
     return MatTexture(
         albedo=_mips(raw.get("albedo")),
         mgn=_mips(raw.get("mgn")),
         uv_scale=scale,
         uv_offset=offset,
+        uv_rotate=rotate,
         params=dict(raw.get("params") or {}),
     )
 
