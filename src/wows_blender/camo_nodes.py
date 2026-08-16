@@ -428,7 +428,7 @@ def apply_path_b(
     inf = params.get("mgn_influence") or (0.0, 0.0, 0.0)
     inf_m, inf_g = float(inf[0]), float(inf[1])
     inf_n = float(inf[2]) if len(inf) > 2 else 0.0
-    if resolved.mgn_png is not None and (inf_m > 0.0 or inf_g > 0.0 or inf_n > 0.0):
+    if resolved.mgn_png is not None:
         mgn_img = load_image(resolved.mgn_png, colorspace="Non-Color")
         if mgn_img is not None:
             mgn_tex = _uv_mapped_texture(
@@ -441,27 +441,35 @@ def apply_path_b(
             sep.name = "WoWS_camo_mgn_sep"
             sep.location = (_X0 + 1200, _Y0 - 1400)
             nt.links.new(mgn_tex.outputs["Color"], sep.inputs["Color"])
-            # Engine law weights MGN by catPaint (nb×mg gate), NOT the
-            # tile alpha — URP WgShipCamo.hlsl::ApplyMgnOverrides /
-            # camo_path_b_render_re.md §7.1: w = catPaint × Influence_*.
-            if cat_paint is not None:
-                w_m = _math(nt, "MULTIPLY", (_X0 + 1500, _Y0 - 1350),
-                            "WoWS_camo_mgnWm", a=cat_paint, bv=inf_m)
-                w_g = _math(nt, "MULTIPLY", (_X0 + 1500, _Y0 - 1550),
-                            "WoWS_camo_mgnWg", a=cat_paint, bv=inf_g)
-            else:
-                w_m = _math(nt, "MULTIPLY", (_X0 + 1500, _Y0 - 1350),
-                            "WoWS_camo_mgnWm", av=1.0, bv=inf_m)
-                w_g = _math(nt, "MULTIPLY", (_X0 + 1500, _Y0 - 1550),
-                            "WoWS_camo_mgnWg", av=1.0, bv=inf_g)
+            # Engine law (chunk001:680-696) — metal and gloss are
+            # ASYMMETRIC. Metal: Influence_m scales the camo VALUE
+            # (metalMixCamo = mgn.G × inf_m feeds camoF0) and the
+            # base→camo blend weight is catPaint ALONE — a Part_mgn at
+            # influence 0 wipes base metal on painted texels. Gloss:
+            # Influence_g sits in the WEIGHT (w = catPaint × inf_g), so
+            # inf_g = 0 keeps the base response.
             metal_sink = bsdf.inputs.get("Metallic")
             rough_sink = bsdf.inputs.get("Roughness")
             if metal_sink is not None:
+                v_m = _math(nt, "MULTIPLY", (_X0 + 1500, _Y0 - 1350),
+                            "WoWS_camo_mgnVm", a=sep.outputs["Green"], bv=inf_m)
+                if cat_paint is not None:
+                    w_m = _math(nt, "MULTIPLY", (_X0 + 1500, _Y0 - 1250),
+                                "WoWS_camo_mgnWm", a=cat_paint, bv=1.0)
+                else:
+                    w_m = _math(nt, "MULTIPLY", (_X0 + 1500, _Y0 - 1250),
+                                "WoWS_camo_mgnWm", av=1.0, bv=1.0)
                 _float_lerp_into(
-                    nt, metal_sink, sep.outputs["Green"], w_m.outputs[0],
+                    nt, metal_sink, v_m.outputs[0], w_m.outputs[0],
                     "WoWS_camo_mgnMetal", (_X0 + 1800, _Y0 - 1350),
                 )
-            if rough_sink is not None:
+            if rough_sink is not None and inf_g > 0.0:
+                if cat_paint is not None:
+                    w_g = _math(nt, "MULTIPLY", (_X0 + 1500, _Y0 - 1550),
+                                "WoWS_camo_mgnWg", a=cat_paint, bv=inf_g)
+                else:
+                    w_g = _math(nt, "MULTIPLY", (_X0 + 1500, _Y0 - 1550),
+                                "WoWS_camo_mgnWg", av=1.0, bv=inf_g)
                 rough = _math(nt, "SUBTRACT", (_X0 + 1500, _Y0 - 1750),
                               "WoWS_camo_mgnRough", av=1.0, b=sep.outputs["Red"])
                 _float_lerp_into(

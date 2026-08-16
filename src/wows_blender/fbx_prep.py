@@ -418,12 +418,38 @@ def bake_camo_mgn_mr(
     """
     counts = counts or PrepCounts()
     targets: dict[str, tuple[bpy.types.Material, bpy.types.Image, bpy.types.Node]] = {}
-    mats = [
-        m for m in scene_materials()
-        if m.use_nodes
-        and (inf := m.get("wows_camo_mgn_influence")) is not None
-        and (float(inf[0]) > 0.0 or float(inf[1]) > 0.0)
-    ]
+
+    # Engine metal law: Influence_m scales the camo VALUE, but the
+    # base→camo blend weight is the paint mask alone — so a Part_mgn at
+    # influence 0 still WIPES base metal on painted texels. That makes
+    # the bake necessary even at zero influence whenever the base MR
+    # actually carries metal; when it doesn't (metal ≈ 0, e.g. the Azur
+    # accessory sets), the wipe is a visual no-op and skipping avoids
+    # per-material baked-image bloat.
+    _metal_max_cache: dict[str, float] = {}
+
+    def _base_metal_max(mat: bpy.types.Material) -> float:
+        node = mat.node_tree.nodes.get("WoWS_metallicRoughness")
+        img = getattr(node, "image", None) if node is not None else None
+        if img is None or not img.size[0]:
+            return 0.0
+        key = img.name
+        if key not in _metal_max_cache:
+            import numpy as np
+            buf = np.empty(len(img.pixels), dtype=np.float32)
+            img.pixels.foreach_get(buf)
+            _metal_max_cache[key] = float(buf[2::4].max())  # B = metallic
+        return _metal_max_cache[key]
+
+    def _needs_bake(mat: bpy.types.Material) -> bool:
+        inf = mat.get("wows_camo_mgn_influence")
+        if inf is None:
+            return False
+        if float(inf[0]) > 0.0 or float(inf[1]) > 0.0:
+            return True
+        return _base_metal_max(mat) > 0.02
+
+    mats = [m for m in scene_materials() if m.use_nodes and _needs_bake(m)]
     if not mats:
         return counts
     out_dir.mkdir(parents=True, exist_ok=True)
