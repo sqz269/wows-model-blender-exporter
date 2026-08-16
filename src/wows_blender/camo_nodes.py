@@ -171,6 +171,30 @@ def _uv_mapped_texture(
 _NB_DENY = (0.5333, 0.7333, 0.8666, 0.9333)
 
 
+def _float_lerp_into(nt, sink, override_socket, weight_socket, name, location):
+    """Rewire a float BSDF input: ``sink = mix(current, override, weight)``.
+
+    Built from Math nodes (``cur + (override - cur) * w``) instead of
+    ``ShaderNodeMix`` — the modern Mix node exposes one same-named A/B
+    pair per data type, which is only addressable positionally and has
+    shifted between Blender majors.
+    """
+    x, y = location
+    cur_link = next((l for l in nt.links if l.to_socket == sink), None)
+    if cur_link is not None:
+        cur_src = cur_link.from_socket
+        sub = _math(nt, "SUBTRACT", (x, y), name + "_d", a=override_socket, b=cur_src)
+        mul = _math(nt, "MULTIPLY", (x + 180, y), name + "_w", a=sub.outputs[0], b=weight_socket)
+        add = _math(nt, "ADD", (x + 360, y), name, a=cur_src, b=mul.outputs[0])
+        nt.links.remove(cur_link)
+    else:
+        curv = float(sink.default_value)
+        sub = _math(nt, "SUBTRACT", (x, y), name + "_d", a=override_socket, bv=curv)
+        mul = _math(nt, "MULTIPLY", (x + 180, y), name + "_w", a=sub.outputs[0], b=weight_socket)
+        add = _math(nt, "ADD", (x + 360, y), name, av=curv, b=mul.outputs[0])
+    nt.links.new(add.outputs[0], sink)
+
+
 def _math(nt, op, location, name, *, a=None, b=None, av=None, bv=None):
     """One Math node with inputs linked (a/b sockets) or set (av/bv)."""
     n = nt.nodes.new("ShaderNodeMath")
@@ -371,6 +395,57 @@ def apply_path_b(
         if link.to_socket == sink:
             nt.links.remove(link)
     nt.links.new(f_out, sink)
+
+    # ---- MGN override: camo metal/gloss folded into the MR chain ------
+    # camoMGN packs R=gloss, G=metallic (B/A = normals, not consumed
+    # here); mgn_influence = [metal, gloss, normal] mixes
+    # (ship_camo_mgn_material.fx cb mgnInfluence.xyz — .w is dead).
+    # Weighted by the SAME per-texel blend factor `t` the albedo uses,
+    # so the surface response changes exactly where the paint lands.
+    # Normal override (.z) is not wired — ≤0.1 on every skin shipped so
+    # far except mat_HW2023 (0.9); revisit if that ships.
+    inf = params.get("mgn_influence") or (0.0, 0.0, 0.0)
+    inf_m, inf_g = float(inf[0]), float(inf[1])
+    if resolved.mgn_png is not None and (inf_m > 0.0 or inf_g > 0.0):
+        mgn_img = load_image(resolved.mgn_png, colorspace="Non-Color")
+        if mgn_img is not None:
+            mgn_tex = _uv_mapped_texture(
+                mat, mgn_img,
+                uv_scale=resolved.uv_scale, uv_offset=resolved.uv_offset,
+                location=(_X0 + 900, _Y0 - 1400), name="WoWS_camo_mgn",
+            )
+            sep = nt.nodes.new("ShaderNodeSeparateColor")
+            sep.name = "WoWS_camo_mgn_sep"
+            sep.location = (_X0 + 1200, _Y0 - 1400)
+            nt.links.new(mgn_tex.outputs["Color"], sep.inputs["Color"])
+            # Engine law weights MGN by catPaint (nb×mg gate), NOT the
+            # tile alpha — URP WgShipCamo.hlsl::ApplyMgnOverrides /
+            # camo_path_b_render_re.md §7.1: w = catPaint × Influence_*.
+            if cat_paint is not None:
+                w_m = _math(nt, "MULTIPLY", (_X0 + 1500, _Y0 - 1350),
+                            "WoWS_camo_mgnWm", a=cat_paint, bv=inf_m)
+                w_g = _math(nt, "MULTIPLY", (_X0 + 1500, _Y0 - 1550),
+                            "WoWS_camo_mgnWg", a=cat_paint, bv=inf_g)
+            else:
+                w_m = _math(nt, "MULTIPLY", (_X0 + 1500, _Y0 - 1350),
+                            "WoWS_camo_mgnWm", av=1.0, bv=inf_m)
+                w_g = _math(nt, "MULTIPLY", (_X0 + 1500, _Y0 - 1550),
+                            "WoWS_camo_mgnWg", av=1.0, bv=inf_g)
+            metal_sink = bsdf.inputs.get("Metallic")
+            rough_sink = bsdf.inputs.get("Roughness")
+            if metal_sink is not None:
+                _float_lerp_into(
+                    nt, metal_sink, sep.outputs["Green"], w_m.outputs[0],
+                    "WoWS_camo_mgnMetal", (_X0 + 1800, _Y0 - 1350),
+                )
+            if rough_sink is not None:
+                rough = _math(nt, "SUBTRACT", (_X0 + 1500, _Y0 - 1750),
+                              "WoWS_camo_mgnRough", av=1.0, b=sep.outputs["Red"])
+                _float_lerp_into(
+                    nt, rough_sink, rough.outputs[0], w_g.outputs[0],
+                    "WoWS_camo_mgnRoughMix", (_X0 + 1800, _Y0 - 1550),
+                )
+            mat["wows_camo_mgn_influence"] = [inf_m, inf_g, float(inf[2] if len(inf) > 2 else 0.0)]
 
     mat["wows_camo_path"] = "B"
     mat["wows_camo_category"] = resolved.category

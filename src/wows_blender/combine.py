@@ -46,7 +46,7 @@ _SUFFIX_RE = re.compile(r"\.\d+$")
 _SLOT_NODES = (
     "WoWS_baseColor", "WoWS_camo_matAlbedo", "WoWS_baseColor_baked",
     "WoWS_metallicRoughness", "WoWS_normal", "WoWS_occlusion",
-    "WoWS_emissive",
+    "WoWS_emissive", "WoWS_camo_mgn",
 )
 
 
