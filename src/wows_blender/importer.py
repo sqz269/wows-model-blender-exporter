@@ -28,7 +28,12 @@ from bpy.props import BoolProperty, IntProperty, StringProperty
 from bpy.types import Operator
 from bpy_extras.io_utils import ExportHelper, ImportHelper
 
-from .build import DEFAULT_SKIN_ID, build_ship, list_skins
+from .build import (
+    DEFAULT_SKIN_ID,
+    build_ship,
+    list_skins,
+    reconcile_mirrored_skin_normals,
+)
 from .fbx_prep import PrepCounts, bake_base_color, prep_all_materials, write_material_manifest
 
 logger = logging.getLogger(__name__)
@@ -40,6 +45,12 @@ def _import_glb(glb_path: Path) -> list[bpy.types.Object]:
     bpy.ops.import_scene.gltf(filepath=str(glb_path))
     after = set(bpy.context.scene.objects)
     new = list(after - before)
+    fixed = reconcile_mirrored_skin_normals(
+        [obj for obj in new if obj.type == "MESH"])
+    if fixed:
+        logger.info(
+            "reconciled inside-out skin normals on %d mesh(es) from %s",
+            fixed, glb_path.name)
     return [obj for obj in new if obj.parent not in new]
 
 

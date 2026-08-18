@@ -126,7 +126,80 @@ def _import_glb(glb_path: Path) -> list[bpy.types.Object]:
     bpy.ops.import_scene.gltf(filepath=str(glb_path))
     after = set(bpy.context.scene.objects)
     new = list(after - before)
-    return [obj for obj in new if obj.parent not in new]
+    roots = [obj for obj in new if obj.parent not in new]
+    fixed = reconcile_mirrored_skin_normals(
+        [obj for obj in new if obj.type == "MESH"])
+    if fixed:
+        logger.info(
+            "reconciled inside-out skin normals on %d mesh(es) from %s",
+            fixed, glb_path.name)
+    return roots
+
+
+def reconcile_mirrored_skin_normals(objs: list[bpy.types.Object]) -> int:
+    """Fix inside-out custom normals on Z-mirror (det<0) skinned imports.
+
+    det<0 rigs store bind-frame vertex data whose triangle winding is
+    source-order — the runtime skin un-mirrors it, so glTF consumers that
+    honour the mirrored joints render correctly. Blender's glTF importer
+    instead parks the mirror in the rig (bone rest != bind): on evaluation
+    the positions mirror and the apparent winding lands outward-correct,
+    but the custom split normals decode relative to the *unflipped* loop
+    fans, so every normal comes out pointing INTO the surface. Everything
+    downstream (renders, bakes, mesh exports) then lights the
+    armature-deformed meshes inside-out while static meshes stay healthy.
+
+    Detection runs on the EVALUATED mesh: the fraction of faces whose
+    stored corner normals agree with the winding-derived face normal.
+    Below 0.5 the normals sit on the wrong side of their own faces —
+    winding is authoritative post-evaluation — so negate the raw custom
+    normals (winding untouched); re-evaluation then lands outward.
+    Meshes without custom normals cannot trigger (their normals follow
+    the loop fans by construction), and det>0 rigs pass untouched.
+    """
+    candidates: list[bpy.types.Object] = []
+    seen_data: set[str] = set()
+    for obj in objs:
+        if obj.type != "MESH" or len(obj.data.polygons) == 0:
+            continue
+        if not any(m.type == "ARMATURE" and m.object is not None
+                   for m in obj.modifiers):
+            continue
+        if obj.data.name in seen_data:
+            continue
+        seen_data.add(obj.data.name)
+        candidates.append(obj)
+    if not candidates:
+        return 0
+
+    deps = bpy.context.evaluated_depsgraph_get()
+    fixed = 0
+    for obj in candidates:
+        ev = obj.evaluated_get(deps)
+        me = ev.to_mesh()
+        try:
+            agree = total = 0
+            for poly in me.polygons:
+                if poly.normal.length < 1e-9:
+                    continue
+                acc = mathutils.Vector((0.0, 0.0, 0.0))
+                for li in range(poly.loop_start,
+                                poly.loop_start + poly.loop_total):
+                    acc += me.loops[li].normal
+                if acc.length < 1e-9:
+                    continue
+                total += 1
+                if poly.normal.dot(acc) > 0.0:
+                    agree += 1
+        finally:
+            ev.to_mesh_clear()
+        if total == 0 or agree / total >= 0.5:
+            continue
+        raw = obj.data
+        raw.normals_split_custom_set(
+            [(-l.normal.x, -l.normal.y, -l.normal.z) for l in raw.loops])
+        fixed += 1
+    return fixed
 
 
 def _glb_mesh_node_names(glb_path: Path) -> list[tuple[str, int]]:
