@@ -31,8 +31,11 @@ restores the render-accurate graph.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import os
+import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -234,14 +237,191 @@ def _mesh_objects(root: bpy.types.Object | None) -> list[bpy.types.Object]:
     return [o for o in root.children_recursive if o.type == "MESH"]
 
 
+# Bump when the bake pipeline itself changes behaviour (pass settings,
+# AO handling, margin strategy…) — every cached entry keyed under the old
+# version silently stops matching, which is exactly the invalidation we
+# want.
+BAKE_CACHE_VERSION = 1
+
+
+def _image_cache_sig(img: bpy.types.Image) -> str:
+    """Identity of a source image for cache keying: the on-disk file's
+    path + size + mtime. Image datablock names are NOT used when a path
+    exists — dedup suffixes (``.001``) vary with import order and would
+    fragment the cache for no reason."""
+    path = ""
+    if img.filepath:
+        try:
+            path = os.path.abspath(bpy.path.abspath(img.filepath))
+        except (OSError, ValueError):
+            path = img.filepath
+    if path and os.path.isfile(path):
+        st = os.stat(path)
+        return f"{path}|{st.st_size}|{st.st_mtime_ns}"
+    return f"name:{img.name}|{img.size[0]}x{img.size[1]}"
+
+
+# The bake's own OUTPUTS, not inputs: the base-color pass adds these
+# nodes/props before the MGN pass keys its materials, and they embed the
+# per-run output PNG's path + mtime — including them makes every MGN key
+# unique per run and the cache never hits. (Node names are matched by
+# prefix to catch ``.001`` dedup suffixes.)
+_SIG_EXCLUDE_NODES = ("WoWS_fbx_bake_target", "WoWS_baseColor_baked")
+_SIG_EXCLUDE_PROPS = {"wows_fbx_baked", "wows_mgn_mr_baked"}
+
+
+def _material_cache_sig(mat: bpy.types.Material) -> str:
+    """Deterministic serialization of everything in a material that can
+    change a bake result: node types + unlinked input values + image
+    identities + link topology + ``wows_*`` custom props."""
+    nt = mat.node_tree
+    parts: list[str] = [f"v{BAKE_CACHE_VERSION}"]
+    for node in sorted(nt.nodes, key=lambda n: n.name):
+        if node.name.startswith(_SIG_EXCLUDE_NODES):
+            continue
+        entry = [node.name, node.bl_idname]
+        for sock in node.inputs:
+            if sock.is_linked:
+                continue
+            dv = getattr(sock, "default_value", None)
+            if dv is None:
+                continue
+            try:
+                entry.append(f"{sock.identifier}={tuple(dv)}")
+            except TypeError:
+                entry.append(f"{sock.identifier}={dv}")
+        img = getattr(node, "image", None)
+        if img is not None:
+            entry.append(f"img={_image_cache_sig(img)}")
+            entry.append(f"cs={img.colorspace_settings.name}")
+        for attr in ("extension", "interpolation", "vector_type",
+                     "blend_type", "data_type", "operation", "mode"):
+            val = getattr(node, attr, None)
+            if isinstance(val, str):
+                entry.append(f"{attr}={val}")
+        ramp = getattr(node, "color_ramp", None)
+        if ramp is not None:
+            entry.append("ramp=" + ";".join(
+                f"{e.position:.6f}:{tuple(e.color)}" for e in ramp.elements
+            ) + f"|{ramp.interpolation}")
+        parts.append("|".join(entry))
+    for link in sorted(
+        nt.links,
+        key=lambda l: (l.from_node.name, l.from_socket.identifier,
+                       l.to_node.name, l.to_socket.identifier),
+    ):
+        if (link.from_node.name.startswith(_SIG_EXCLUDE_NODES)
+                or link.to_node.name.startswith(_SIG_EXCLUDE_NODES)):
+            continue
+        parts.append(
+            f"L:{link.from_node.name}.{link.from_socket.identifier}"
+            f"->{link.to_node.name}.{link.to_socket.identifier}"
+        )
+    for key in sorted(
+        k for k in mat.keys()
+        if k.startswith("wows_") and k not in _SIG_EXCLUDE_PROPS
+    ):
+        val = mat[key]
+        try:
+            val = tuple(val)
+        except TypeError:
+            pass
+        parts.append(f"P:{key}={val}")
+    return "\n".join(parts)
+
+
+def _material_uv_signatures(
+    meshes: list[bpy.types.Object], wanted: set[str],
+) -> dict[str, str]:
+    """Order-invariant hash of the UV loops assigned to each wanted
+    material, unioned across the scene. The bake rasterizes exactly these
+    islands (everything else is EXTEND flood), so two scenes whose
+    coverage differs — e.g. an intact hull with its seam patches vs the
+    wreck that removed them — must key to different cache entries."""
+    import numpy as np
+
+    accum: dict[str, list[bytes]] = {name: [] for name in wanted}
+    for obj in meshes:
+        me = obj.data
+        if not me.uv_layers or not me.polygons:
+            continue
+        slot_names = [s.material.name if s.material else "" for s in obj.material_slots]
+        if not any(n in wanted for n in slot_names):
+            continue
+        uv = np.empty(len(me.loops) * 2, dtype=np.float32)
+        me.uv_layers.active.data.foreach_get("uv", uv)
+        uv = uv.reshape(-1, 2)
+        pmat = np.empty(len(me.polygons), dtype=np.int32)
+        me.polygons.foreach_get("material_index", pmat)
+        ltot = np.empty(len(me.polygons), dtype=np.int32)
+        me.polygons.foreach_get("loop_total", ltot)
+        loop_mat = np.repeat(pmat, ltot)
+        for slot_idx, name in enumerate(slot_names):
+            if name not in accum:
+                continue
+            sel = uv[loop_mat == slot_idx]
+            if len(sel):
+                accum[name].append(sel.tobytes())
+    out: dict[str, str] = {}
+    for name, chunks in accum.items():
+        if not chunks:
+            out[name] = "nouv"
+            continue
+        arr = np.frombuffer(b"".join(chunks), dtype=np.float32).reshape(-1, 2)
+        order = np.lexsort((arr[:, 1], arr[:, 0]))
+        out[name] = hashlib.sha1(arr[order].tobytes()).hexdigest()
+    return out
+
+
+def _bake_cache_key(
+    mat: bpy.types.Material, mat_size: int, pass_tag: str, uv_sig: str,
+) -> str:
+    h = hashlib.sha1()
+    h.update(f"{pass_tag}|{mat_size}|{uv_sig}|".encode())
+    h.update(_material_cache_sig(mat).encode())
+    return h.hexdigest()
+
+
+def _bake_cache_load(cache_dir: Path, key: str, out_path: Path) -> bool:
+    src = cache_dir / f"{key}.png"
+    if not src.is_file():
+        return False
+    try:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, out_path)
+    except OSError as e:
+        logger.warning("bake cache load failed for %s: %s", key, e)
+        return False
+    return True
+
+
+def _bake_cache_store(cache_dir: Path, key: str, png_path: Path) -> None:
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        tmp = cache_dir / f".{key}.{os.getpid()}.tmp"
+        shutil.copy2(png_path, tmp)
+        os.replace(tmp, cache_dir / f"{key}.png")
+    except OSError as e:
+        logger.warning("bake cache store failed for %s: %s", key, e)
+
+
 def bake_base_color(
     root: bpy.types.Object | None,
     out_dir: Path,
     *,
     size: int = 2048,
     counts: PrepCounts | None = None,
+    cache_dir: Path | None = None,
 ) -> PrepCounts:
     """Bake each material's evaluated Base Color into its own PNG.
+
+    With ``cache_dir`` set, each material's bake is reused from a
+    content-keyed cache when nothing that feeds it changed: the key
+    covers the node graph (values, links, source image files + mtimes),
+    the material's scene-wide UV coverage, the bake size and
+    :data:`BAKE_CACHE_VERSION`. The wreck export of a ship hits the
+    entries its intact export just wrote, and a re-export with unchanged
+    textures skips Cycles entirely.
 
     This is what makes camo survive the trip: Path A is a per-pixel
     palette lerp against a mask, which no FBX material slot can express.
@@ -288,14 +468,7 @@ def bake_base_color(
     # meshes must accumulate all their islands into one target.
     scene.render.bake.use_clear = False
 
-    # One bake target per material, made the active node so Cycles writes
-    # into it. Materials with no UV-mapped mesh are skipped by Blender.
-    # Each target is sized to the material's SOURCE albedo (capped at
-    # ``size``): a 256² fitting must not become a 2048² bake — measured
-    # on Azur Baltimore, uniform 2048² bakes ballooned the Unity bundle
-    # from ~70 MB to 516 MB. The camo overlay is low-frequency, so
-    # clamping to the part's native texel density loses nothing visible.
-    targets: dict[str, tuple[bpy.types.Material, bpy.types.Image, bpy.types.Node]] = {}
+    candidates: list[bpy.types.Material] = []
     for mat in {m for o in meshes for m in o.data.materials if m is not None}:
         if not mat.use_nodes:
             continue
@@ -317,6 +490,61 @@ def bake_base_color(
         # and keeps intact/wreck exports pixel-identical by construction.
         if not mat.get("wows_camo_path"):
             continue
+        candidates.append(mat)
+
+    # Cache partition: restore hits to the exact post-bake node state
+    # (target node linked to Base Color) without touching Cycles.
+    cache_keys: dict[str, str] = {}
+    cache_hits = 0
+    if cache_dir is not None and candidates:
+        uv_sigs = _material_uv_signatures(meshes, {m.name for m in candidates})
+        remaining: list[bpy.types.Material] = []
+        for mat in candidates:
+            key = _bake_cache_key(
+                mat, _bake_size_for(mat, size), "diffuse",
+                uv_sigs.get(mat.name, "nouv"),
+            )
+            cache_keys[mat.name] = key
+            out_path = out_dir / f"{_safe_name(mat.name)}_baked.png"
+            if not _bake_cache_load(cache_dir, key, out_path):
+                remaining.append(mat)
+                continue
+            img = bpy.data.images.load(str(out_path), check_existing=False)
+            node = mat.node_tree.nodes.new("ShaderNodeTexImage")
+            node.image = img
+            node.name = "WoWS_baseColor_baked"
+            node.location = (600, 400)
+            node.select = True
+            # Keep the cache node ACTIVE: a mesh mixing cached and
+            # to-bake materials is still selected for the bake below,
+            # and Cycles writes every selected material's islands into
+            # its active image node — pointing that at the
+            # identical-content cached image keeps the incidental
+            # rewrite harmless.
+            mat.node_tree.nodes.active = node
+            bsdf = _principled(mat)
+            bc = _socket(bsdf, "Base Color") if bsdf else None
+            if bc is not None:
+                _clear_links_to(mat.node_tree, bc)
+                mat.node_tree.links.new(node.outputs["Color"], bc)
+            mat["wows_fbx_baked"] = True
+            counts.baked += 1
+            cache_hits += 1
+        candidates = remaining
+        logger.info(
+            "bake cache: %d base-color hit(s), %d to bake",
+            cache_hits, len(candidates),
+        )
+
+    # One bake target per material, made the active node so Cycles writes
+    # into it. Materials with no UV-mapped mesh are skipped by Blender.
+    # Each target is sized to the material's SOURCE albedo (capped at
+    # ``size``): a 256² fitting must not become a 2048² bake — measured
+    # on Azur Baltimore, uniform 2048² bakes ballooned the Unity bundle
+    # from ~70 MB to 516 MB. The camo overlay is low-frequency, so
+    # clamping to the part's native texel density loses nothing visible.
+    targets: dict[str, tuple[bpy.types.Material, bpy.types.Image, bpy.types.Node]] = {}
+    for mat in candidates:
         mat_size = _bake_size_for(mat, size)
         img = bpy.data.images.new(
             f"{mat.name}_baked", width=mat_size, height=mat_size, alpha=True,
@@ -331,7 +559,10 @@ def bake_base_color(
 
     if not targets:
         scene.render.engine = prev_engine
-        counts.notes.append("bake skipped: no node-based materials")
+        if cache_hits:
+            counts.notes.append(f"bake: all {cache_hits} material(s) from cache")
+        else:
+            counts.notes.append("bake skipped: no node-based materials")
         return counts
 
     # AO stays OUT of the bake (see docstring): Fac=0 on the multiply
@@ -343,11 +574,19 @@ def bake_base_color(
             ao.inputs["Fac"].default_value = 0.0
             ao_disabled.append(ao)
 
+    # Select only meshes that actually feed a bake target — baking the
+    # rest is pure per-object Cycles overhead (and writes into whatever
+    # image node happens to be active in their materials).
     for obj in bpy.context.selected_objects:
         obj.select_set(False)
     baked_objects = 0
     for obj in meshes:
         if not obj.data.uv_layers:
+            continue
+        if not any(
+            s.material is not None and s.material.name in targets
+            for s in obj.material_slots
+        ):
             continue
         obj.select_set(True)
         baked_objects += 1
@@ -356,7 +595,7 @@ def bake_base_color(
         counts.notes.append("bake skipped: no mesh carries a UV layer")
         return counts
     bpy.context.view_layer.objects.active = next(
-        o for o in meshes if o.data.uv_layers
+        o for o in meshes if o.select_get()
     )
 
     try:
@@ -390,6 +629,8 @@ def bake_base_color(
         node.name = "WoWS_baseColor_baked"
         mat["wows_fbx_baked"] = True
         counts.baked += 1
+        if cache_dir is not None and name in cache_keys:
+            _bake_cache_store(cache_dir, cache_keys[name], path)
 
     scene.render.engine = prev_engine
     return counts
@@ -400,6 +641,7 @@ def bake_camo_mgn_mr(
     *,
     size: int = 2048,
     counts: PrepCounts | None = None,
+    cache_dir: Path | None = None,
 ) -> PrepCounts:
     """EMIT-bake the camo-MGN-blended metallic/roughness for skins that
     override the surface response (``mgn_influence`` metal/gloss > 0).
@@ -453,6 +695,62 @@ def bake_camo_mgn_mr(
     if not mats:
         return counts
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # Cache partition. A hit can only be honoured when every object it
+    # shares with a to-bake material stays fully covered: the EMIT
+    # selection below requires ALL of an object's materials to carry
+    # bake targets, so a hit sharing an object with a miss would
+    # silently shrink the miss's coverage — demote such hits to misses
+    # until the partition is stable.
+    mr_cache_keys: dict[str, str] = {}
+    if cache_dir is not None:
+        cached: dict[str, str] = {}
+        cand_names = {m.name for m in mats}
+        # The EMIT selection below only bakes objects whose EVERY
+        # material is a target, so the reusable coverage — and therefore
+        # the cache key — is the islands on exactly those objects.
+        covered: list[bpy.types.Object] = []
+        for obj in _mesh_objects(None):
+            if not obj.data.uv_layers:
+                continue
+            names = [s.material.name for s in obj.material_slots if s.material]
+            if names and all(n in cand_names for n in names):
+                covered.append(obj)
+        uv_sigs = _material_uv_signatures(covered, cand_names)
+        for mat in mats:
+            key = _bake_cache_key(
+                mat, _bake_size_for(mat, size), "mgn_mr",
+                uv_sigs.get(mat.name, "nouv"),
+            )
+            mr_cache_keys[mat.name] = key
+            if (cache_dir / f"{key}.png").is_file():
+                cached[mat.name] = key
+        changed = True
+        while changed:
+            changed = False
+            for obj in covered:
+                names = [s.material.name for s in obj.material_slots if s.material]
+                if any(n in cached for n in names) and any(n not in cached for n in names):
+                    for n in names:
+                        if n in cached:
+                            del cached[n]
+                            changed = True
+        hits = 0
+        for mat in [m for m in mats if m.name in cached]:
+            out_path = out_dir / f"{_safe_name(mat.name)}_mrbaked.png"
+            if not _bake_cache_load(cache_dir, cached[mat.name], out_path):
+                continue
+            img = bpy.data.images.load(str(out_path), check_existing=False)
+            img.colorspace_settings.name = "Non-Color"
+            mr_node = _node_or_new_teximage(mat, "WoWS_metallicRoughness")
+            mr_node.image = img
+            mat["wows_mgn_mr_baked"] = True
+            counts.notes.append(f"mgn mr baked (cache): {mat.name}")
+            hits += 1
+            mats = [m for m in mats if m.name != mat.name]
+        logger.info("bake cache: %d mgn-mr hit(s), %d to bake", hits, len(mats))
+        if not mats:
+            return counts
 
     scene = bpy.context.scene
     prev_engine = scene.render.engine
@@ -564,6 +862,8 @@ def bake_camo_mgn_mr(
                 mr_node.image = img
                 mat["wows_mgn_mr_baked"] = True
                 counts.notes.append(f"mgn mr baked: {mat.name}")
+                if cache_dir is not None and mat.name in mr_cache_keys:
+                    _bake_cache_store(cache_dir, mr_cache_keys[mat.name], path)
         for n in scaffolding:
             try:
                 nt.nodes.remove(n)

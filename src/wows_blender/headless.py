@@ -103,6 +103,11 @@ def _build_parser() -> argparse.ArgumentParser:
                          "the placement hierarchy and drops armatures.")
     ap.add_argument("--bake", action="store_true")
     ap.add_argument("--bake-size", type=int, default=2048)
+    ap.add_argument("--bake-cache", type=Path, default=None,
+                    help="Content-keyed bake cache directory: bakes whose "
+                         "inputs (node graph, source image mtimes, UV "
+                         "coverage, size) are unchanged are reused instead "
+                         "of re-run through Cycles.")
     ap.add_argument("--axis-up", default="Y")
     ap.add_argument("--axis-forward", default="-Z")
     ap.add_argument("--scale", type=float, default=1.0)
@@ -290,13 +295,15 @@ def main() -> int:
             counts = bake_base_color(
                 result.root if combine_stats is None else None,
                 bake_dir, size=args.bake_size, counts=counts,
+                cache_dir=args.bake_cache,
             )
             # Metal-finish skins (camo MGN with nonzero metal/gloss
             # influence) also need their blended metallic/roughness
             # flattened — FBX carries one packed _mr per material.
             from wows_blender.fbx_prep import bake_camo_mgn_mr
 
-            counts = bake_camo_mgn_mr(bake_dir, size=args.bake_size, counts=counts)
+            counts = bake_camo_mgn_mr(bake_dir, size=args.bake_size, counts=counts,
+                                      cache_dir=args.bake_cache)
             for note in counts.notes:
                 print(f"warn: {note}", file=sys.stderr)
         before = len(counts.notes)
