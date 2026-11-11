@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Sequence
 
 from .sidecar import CamoCategory, MaterialEntry, MatTexture, Skin
+from .texture_paths import resolve_png
 
 # Hull-side stems classify into one of these; the rest are accessory-side.
 HULL_CATEGORIES: frozenset[str] = frozenset({"tile", "deckhouse", "bulge"})
@@ -93,40 +94,18 @@ def material_category(entry: MaterialEntry) -> str:
     return classify_part_category(stem or entry.material_id)
 
 
-def _candidate_rels(rel: str) -> list[str]:
-    """On-disk-relative candidates for a camo library path.
-
-    Sidecar camo paths carry a ``libraries/`` prefix
-    (``libraries/camo_masks/X.dd0``) but the Blender publish places the
-    atlases at the publish root (``camo_masks/X``). Try the stripped form
-    first, then the literal path.
-    """
-    rel = rel.replace("\\", "/")
-    out = []
-    if rel.startswith("libraries/"):
-        out.append(rel[len("libraries/"):])
-    out.append(rel)
-    return out
-
-
 def resolve_camo_png(publish_root: Path, dds_mips: Sequence[str]) -> Path | None:
     """Resolve a camo mask/atlas mip list to a PNG on disk.
 
     ``publish_root`` is the dest root (the ship folder's parent), under
-    which ``camo_masks/`` and ``camo_mat/`` live. Probes PNG siblings in
-    mip priority order; falls back to a ``.dds`` if no PNG exists.
+    which ``camo_masks/``, ``camo_mat/`` and ``textures_shared/`` live
+    (``libraries/`` paths); other paths resolve against it literally.
+    Passing a model directory instead also works: ``libraries/`` paths
+    then resolve against its nearest ancestor that holds them. Probes PNG
+    siblings in mip priority order; falls back to a ``.dds`` if no PNG
+    exists.
     """
-    for rel in dds_mips:
-        for cand in _candidate_rels(rel):
-            png = (publish_root / cand).with_suffix(".png")
-            if png.is_file():
-                return png
-    for rel in dds_mips:
-        for cand in _candidate_rels(rel):
-            dds = publish_root / cand
-            if dds.is_file() and dds.suffix.lower() == ".dds":
-                return dds
-    return None
+    return resolve_png(publish_root, dds_mips, publish_root)
 
 
 @dataclass(frozen=True)
@@ -180,8 +159,8 @@ def resolve_path_a(
                                  "category", uv_rotate=cat.uv_rotate)
 
     # Step 2: per-stem cascade — texture_sets[scheme_key].baseColor.
-    # Ship-local (no libraries/ prefix); resolve_camo_png handles the
-    # literal path against the model root just as well.
+    # Ship-local, or a shared-store ``libraries/textures_shared/...`` path
+    # (resolved against the publish root above model_root).
     scheme = skin.scheme_key
     per_stem = entry.texture_sets.get(scheme, {}).get("baseColor")
     if per_stem is not None and per_stem.dds_mips:

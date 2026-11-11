@@ -48,6 +48,7 @@ from pathlib import Path
 import bpy  # noqa: F401 — registered as a Blender add-on; ignore in tooling
 
 from .sidecar import MaterialEntry, TextureRef
+from .texture_paths import resolve_png
 
 logger = logging.getLogger(__name__)
 
@@ -74,28 +75,21 @@ _AO_PLACEHOLDER_STEMS: frozenset[str] = frozenset({"default_ao"})
 def _resolve_png_for_texture(model_root: Path, ref: TextureRef) -> Path | None:
     """Resolve a TextureRef to a PNG file on disk.
 
-    ``ref.dds_mips`` is a path list relative to the SHIP'S model
-    directory (for hull materials) or the LIBRARY ASSET's directory
-    (for accessory materials). The caller passes ``model_root`` to
-    match.
+    ``ref.dds_mips`` paths are relative to the SHIP'S model directory
+    (for hull materials) or the LIBRARY ASSET's directory (for accessory
+    materials) -- the caller passes ``model_root`` to match -- except
+    paths that start with ``libraries/``, which are workspace-relative
+    (the shared texture store ``libraries/textures_shared/<key>/...``,
+    the camo libraries) and resolve against the publish root above
+    ``model_root`` (see :mod:`.texture_paths`). Any slot can carry
+    either kind.
 
     The publisher's DDS->PNG pass writes PNGs next to the DDS files
     with the same stem. We probe each mip in priority order and
-    return the first PNG that exists.
+    return the first PNG that exists, else a ``.dds`` (newer Blender +
+    OpenImageIO builds can sometimes load it; the call site logs a miss).
     """
-    for rel in ref.dds_mips:
-        dds = model_root / rel
-        png = dds.with_suffix(".png")
-        if png.is_file():
-            return png
-    # Fallback: hand Blender the DDS directly. Newer Blender + OpenImageIO
-    # builds can sometimes load .dds; .dd0 / .dd1 / .dd2 will fail but
-    # the call site logs the miss.
-    for rel in ref.dds_mips:
-        dds = model_root / rel
-        if dds.is_file() and dds.suffix.lower() == ".dds":
-            return dds
-    return None
+    return resolve_png(model_root, ref.dds_mips)
 
 
 def _load_image(path: Path, *, colorspace: str = "sRGB") -> bpy.types.Image | None:
