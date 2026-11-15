@@ -30,6 +30,7 @@ class WOWS_PT_import_panel(Panel):
         col.operator("wows.import_ship", icon="MESH_DATA")
         col.operator("wows.import_accessory", icon="MESH_CUBE")
         col.operator("wows.list_skins", text="List Skins", icon="COLOR")
+        col.operator("wows.list_hulls", text="List Hulls", icon="MOD_BUILD")
 
         layout.separator()
         col = layout.column(align=True)

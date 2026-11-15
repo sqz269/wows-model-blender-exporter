@@ -34,6 +34,7 @@ import mathutils
 
 from .camo import resolve_path_a
 from .camo_nodes import apply_path_a, apply_path_b
+from .hulls import hull_misc_filters, linked_skin_for
 from .library_index import LibraryAsset, LibraryIndex, load_library_index, resolve_asset_glb
 from .materials import DEFAULT_SCHEME, bind_material
 from .placement import gltf_matrix_to_blender_rows, is_finite_matrix
@@ -54,6 +55,15 @@ logger = logging.getLogger(__name__)
 
 #: Skin id of the bare ship (no camo). Always available.
 DEFAULT_SKIN_ID = "default"
+
+#: "Paint the ship as the game shows it": an exterior's own scheme when one
+#: is built, else the shown hull's linked skin (``hulls.<H>.linked_skin``),
+#: else the bare ship. An empty skin id means the same.
+AUTO_SKIN_ID = "auto"
+
+#: Exterior id of the synthesised base record in ``exteriors[]``: the ship
+#: itself, so asking for it builds no exterior.
+DEFAULT_EXTERIOR_ID = "default"
 
 # Overlay groups the producer bakes into gun/turret accessory GLBs (per-mount
 # armor for the webview's rotating armor view). Blender has no armor-view
@@ -84,7 +94,16 @@ class BuildResult:
     slots_bound: int = 0
     camo_applied: int = 0
     skin_id:     str = DEFAULT_SKIN_ID
+    #: Why ``skin_id`` was painted: ``"requested"`` (named by the caller),
+    #: ``"exterior"`` (the built exterior's scheme), ``"hull"`` (the shown
+    #: hull's linked skin) or ``"none"`` (bare ship by default).
+    skin_source: str = "none"
     exterior_id: str | None = None
+    #: The hull module whose mounts were placed (``hulls`` key), and the
+    #: one the export rendered (``variants.rendered_hull``). Both None for
+    #: a sidecar without a ``hulls`` block.
+    hull:          str | None = None
+    rendered_hull: str | None = None
     mounts_swapped:    int = 0
     decoratives_placed: int = 0
     base_decoratives_dropped: int = 0
@@ -99,6 +118,12 @@ class BuildResult:
             f"skipped {self.skipped}",
             f"{self.slots_bound} texture slots",
         ]
+        if self.hull:
+            bits.append(
+                f"hull {self.hull}"
+                + (" (rendered)" if self.hull == self.rendered_hull
+                   else f" (rendered: {self.rendered_hull})")
+            )
         if self.exterior_id:
             bits.append(
                 f"exterior {self.exterior_id}: {self.mounts_swapped} mounts "
@@ -110,7 +135,9 @@ class BuildResult:
                 f"{self.meshes_kept} meshes kept / {self.meshes_filtered} filtered"
             )
         if self.skin_id != DEFAULT_SKIN_ID:
-            bits.append(f"skin {self.skin_id} on {self.camo_applied} materials")
+            how = {"hull": " (hull-linked)", "exterior": " (exterior scheme)"}.get(
+                self.skin_source, "")
+            bits.append(f"skin {self.skin_id}{how} on {self.camo_applied} materials")
         return ", ".join(bits)
 
 
@@ -527,6 +554,7 @@ def _import_accessory_placements(
     misc_filters: dict[str, list[str] | None] | None = None,
     role_filter: tuple[str, ...] | None = None,
     mount_swaps: dict[str, ExteriorMount] | None = None,
+    swap_needs_base_asset: bool = False,
     skip_skel_ext: bool = False,
     on_warning: Callable[[str], None] | None = None,
 ) -> _PlaceStats:
@@ -537,6 +565,12 @@ def _import_accessory_placements(
     record's own matrix and TRI-STATE misc_filter apply VERBATIM (Unity
     ExteriorComposer parity), and an unresolvable variant asset degrades
     to the base mount — never to a hole in the ship (§12c).
+
+    ``swap_needs_base_asset`` applies a swap only where the placement's
+    asset is the record's ``base_asset_id``. The records are diffed
+    against the rendered hull's mounts; on another hull module a
+    hardpoint can hold a different gun, which the exterior's model remap
+    does not name, so that mount stays as the hull places it.
 
     ``skip_skel_ext`` drops placements with ``source == 'skel_ext_hash'``
     — the hull-baked decoratives layer a hull-swap exterior replaces
@@ -565,6 +599,14 @@ def _import_accessory_placements(
         # own asset / matrix / misc_filter; a missing variant asset falls
         # back to the base mount below.
         swap = mount_swaps.get(p.hp_name) if p.hp_name else None
+        if (swap is not None and swap_needs_base_asset and swap.base_asset_id
+                and swap.base_asset_id != p.asset_id):
+            warn(
+                f"exterior mount {p.hp_name}: the exterior remaps "
+                f"{swap.base_asset_id!r}, this hull places {p.asset_id!r}; "
+                f"keeping the hull's mount"
+            )
+            swap = None
         asset_id = p.asset_id
         matrix16 = p.matrix
         swap_active = False
@@ -834,8 +876,9 @@ def build_ship(
     import_accessories: bool = True,
     bind_materials: bool = True,
     library_root_override: str | Path | None = None,
-    skin_id: str = DEFAULT_SKIN_ID,
+    skin_id: str = AUTO_SKIN_ID,
     exterior_id: str | None = None,
+    hull: str | None = None,
     lod_policy: str = "lod0",
     damage_variants: bool = False,
     overlays: bool = False,
@@ -844,19 +887,35 @@ def build_ship(
 ) -> BuildResult:
     """Build one ship into the current scene and return what happened.
 
+    ``hull`` picks the hull module whose mounts are placed (a ``hulls``
+    key such as ``C_Hull``, any case, or its upgrade module id). Left
+    out, the build shows the rendered hull (``variants.rendered_hull``),
+    whose mounts the render doc holds. Another hull swaps the HP-bound
+    mounts for that hull's snapshot, with its own misc filters; the hull
+    mesh and its decoratives stay (one hull GLB per ship).
+
+    ``skin_id`` names the skin to paint. ``"auto"`` (the default) or an
+    empty id paints the ship as the game shows it: the built exterior's
+    ``camo_scheme_key``, else the shown hull's ``linked_skin``, else the
+    bare ship. ``"default"`` is the bare ship, except on an exterior,
+    whose scheme is part of its look.
+
     ``exterior_id`` selects a mesh-swap exterior from ``exteriors[]``
     (Unity ExteriorComposer parity): the exterior's hull GLB replaces the
     base hull, its ``mounts[]`` swap per-hardpoint assets with their own
     matrices + misc filters, its decoratives file replaces the base
     hull's ``skel_ext_hash`` decoratives layer wholesale, and its
     ``camo_scheme_key`` auto-selects the paint skin unless ``skin_id``
-    names one explicitly.
+    names one explicitly. ``"default"`` (the synthesised base record)
+    builds no exterior.
 
-    Raises ``FileNotFoundError`` when the sidecar or hull GLB is absent —
-    those are hard errors that leave nothing usable in the scene. Softer
-    problems (missing library, unparseable index, individual placements
-    that fail to resolve) are reported through ``on_warning`` and
-    accumulated on the result.
+    Raises ``FileNotFoundError`` when the sidecar or hull GLB is absent, or
+    the exterior is unknown, and :class:`wows_blender.hulls.UnknownHull`
+    (a ``LookupError``) for a hull the sidecar does not list — hard errors
+    that leave nothing usable in the scene. Softer problems (missing
+    library, unparseable index, individual placements that fail to
+    resolve) are reported through ``on_warning`` and accumulated on the
+    result.
     """
     sidecar_path = Path(sidecar_path)
     warnings: list[str] = []
@@ -870,7 +929,8 @@ def build_ship(
     if not sidecar_path.is_file():
         raise FileNotFoundError(f"sidecar not found: {sidecar_path}")
 
-    sidecar = load_ship(sidecar_path)
+    sidecar = load_ship(sidecar_path, hull=hull)
+    off_render_hull = sidecar.hull != sidecar.rendered_hull
 
     ship_dir = sidecar_path.parent
     ship_stem = sidecar_path.name.removesuffix(".meta.json")
@@ -879,7 +939,7 @@ def build_ship(
 
     # ---- exterior resolution -----------------------------------------
     exterior: Exterior | None = None
-    if exterior_id:
+    if exterior_id and exterior_id.lower() != DEFAULT_EXTERIOR_ID:
         exterior = resolve_exterior(sidecar.exteriors, exterior_id)
         if exterior is None:
             available = ", ".join(e.exterior_id for e in sidecar.exteriors) or "(none)"
@@ -906,15 +966,34 @@ def build_ship(
     publish_root = ship_dir.parent
 
     skins = load_skins(sidecar.skins)
-    # An exterior names its paint scheme; an explicit --skin still wins.
-    if exterior is not None and (not skin_id or skin_id == DEFAULT_SKIN_ID):
+    auto_skin = not skin_id or skin_id == AUTO_SKIN_ID
+    skin_source = "requested"
+    if exterior is not None and (auto_skin or skin_id == DEFAULT_SKIN_ID):
+        # An exterior names its paint scheme; an explicit --skin still wins.
         skin_id = exterior.camo_scheme_key or DEFAULT_SKIN_ID
+        skin_source = "exterior"
+    elif auto_skin:
+        # The shown hull's linked skin (GameParams `linkedCamouflage`):
+        # the game paints it whenever that hull / branch is selected.
+        linked = linked_skin_for(sidecar.raw, sidecar.hull)
+        if linked and any(s.skin_id == linked for s in skins):
+            skin_id = linked
+            skin_source = "hull"
+        else:
+            if linked:
+                warn(
+                    f"hull {sidecar.hull} links skin {linked!r}, which this "
+                    f"sidecar's skins[] lacks; building the default ship."
+                )
+            skin_id = DEFAULT_SKIN_ID
     skin = resolve_skin(skins, skin_id)
     if skin_id and skin_id != DEFAULT_SKIN_ID and skin is None:
         warn(
             f"skin {skin_id!r} not found in this sidecar "
             f"({len(skins)} available); building the default ship."
         )
+    if skin is None:
+        skin_source = "none"
     # A Path-A/B skin selects which material ``texture_sets`` block to
     # sample. Skins whose scheme is absent from a material fall back to
     # ``main`` inside bind_material, so this is safe to pass through.
@@ -940,8 +1019,12 @@ def build_ship(
     root["wows_ship_name"]      = sidecar.ship_name
     root["wows_schema_version"] = sidecar.schema_version
     root["wows_skin_id"]        = skin.skin_id if skin is not None else DEFAULT_SKIN_ID
+    root["wows_skin_source"]    = skin_source
     if exterior is not None:
         root["wows_exterior_id"] = exterior.exterior_id
+    if sidecar.hull:
+        root["wows_hull"]          = sidecar.hull
+        root["wows_rendered_hull"] = sidecar.rendered_hull or ""
 
     # Hull.
     hull_objs = _import_glb(hull_glb)
@@ -1002,10 +1085,16 @@ def build_ship(
                 replaces_deco = bool(
                     ext_hull is not None and ext_hull.decoratives
                 )
+                misc_filters = _misc_filter_from_sidecar(sidecar.raw)
+                if off_render_hull and sidecar.hull:
+                    # The top-level filters describe the rendered hull's
+                    # components; the shown hull's own snapshot wins.
+                    misc_filters.update(hull_misc_filters(sidecar.raw, sidecar.hull))
                 stats = _import_accessory_placements(
                     sidecar.placements, library, library_root, root,
-                    misc_filters=_misc_filter_from_sidecar(sidecar.raw),
+                    misc_filters=misc_filters,
                     mount_swaps=mount_swaps,
+                    swap_needs_base_asset=off_render_hull,
                     skip_skel_ext=replaces_deco,
                     on_warning=warn,
                 )
@@ -1082,7 +1171,10 @@ def build_ship(
         slots_bound=bound_count,
         camo_applied=camo_count,
         skin_id=skin.skin_id if skin is not None else DEFAULT_SKIN_ID,
+        skin_source=skin_source,
         exterior_id=exterior.exterior_id if exterior is not None else None,
+        hull=sidecar.hull,
+        rendered_hull=sidecar.rendered_hull,
         mounts_swapped=stats.mounts_swapped,
         decoratives_placed=deco_placed,
         base_decoratives_dropped=stats.skel_ext_dropped,
@@ -1099,6 +1191,8 @@ def list_skins(sidecar_path: Path) -> tuple[Skin, ...]:
 
 
 __all__ = [
+    "AUTO_SKIN_ID",
+    "DEFAULT_EXTERIOR_ID",
     "DEFAULT_SKIN_ID",
     "BuildResult",
     "apply_content_filter",

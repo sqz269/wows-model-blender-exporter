@@ -148,9 +148,25 @@ wows-export-blender BA_Montana --list-skins    # what does this ship offer?
 ```
 
 In Blender, set **Skin** on the import operator (or the `--skin` flag
-for FBX). `default` is the bare ship. Transparent materials never take
-paint, and a material with no `camoExclusionMask` is left unpainted
-rather than tinted ungated.
+for FBX). `default` is the bare ship. The default, `auto`, paints the
+ship as the game shows it: a hull that links a skin (the event ships'
+per-branch Bermuda tiles, Obsession's bot tile) wears it, everything
+else is bare. Transparent materials never take paint, and a material
+with no `camoExclusionMask` is left unpainted rather than tinted ungated.
+
+## Hull modules
+
+A ship with several hull modules gets one hull mesh and one mount set
+per module. The import shows the hull the export rendered
+(`variants.rendered_hull`); `--hull` (or **Hull** on the import
+operator) shows another, with that hull's mounts and its linked skin:
+
+```bash
+wows-export-blender Siegfried_1510 --list-hulls   # what does this ship offer?
+wows-export-blender Siegfried_1510 --accessories --fbx --bake --hull C_Hull
+```
+
+See [`docs/hulls.md`](docs/hulls.md).
 
 ## FBX export
 
@@ -212,6 +228,7 @@ wows-model-blender-exporter/
 │       ├── library_index.py           ← accessory library index reader
 │       ├── placement.py               ← gltf→Blender transform math
 │       ├── camo.py                    ← which mask / palette / atlas applies
+│       ├── hulls.py                   ← rendered hull, hull swaps, linked skins
 │       ├── visibility.py              ← LOD / damage / overlay classification
 │       │   # bpy-dependent — only runs inside Blender
 │       ├── materials.py               ← Principled BSDF binder
@@ -225,11 +242,12 @@ wows-model-blender-exporter/
     ├── README.md                      ← docs index
     ├── coord_conventions.md
     ├── material_binding.md
-    └── fbx.md                         ← FBX export
+    ├── fbx.md                         ← FBX export
+    └── hulls.md                       ← hull modules + hull-linked skins
 ```
 
 The `wows_blender` package is split so the decision-making half
-(`sidecar`, `camo`, `visibility`, `placement`, `library_index`) imports
+(`sidecar`, `hulls`, `camo`, `visibility`, `placement`, `library_index`) imports
 without `bpy` and can be exercised from a normal Python interpreter;
 only the half that builds datablocks needs Blender.
 

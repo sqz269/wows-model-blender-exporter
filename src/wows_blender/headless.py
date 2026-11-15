@@ -35,6 +35,7 @@ from wows_blender.fbx_prep import (  # noqa: E402
     prep_all_materials,
     write_material_manifest,
 )
+from wows_blender.hulls import UnknownHull  # noqa: E402
 
 EXIT_OK = 0
 EXIT_ARGS = 2
@@ -53,7 +54,14 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--sidecar", required=True, type=Path)
     ap.add_argument("--out", type=Path, help="Destination .fbx path.")
     ap.add_argument("--manifest", type=Path, help="Destination material-manifest JSON.")
-    ap.add_argument("--skin", default="default")
+    ap.add_argument("--skin", default="auto",
+                    help="skin_id to paint. 'auto' (default): the exterior's "
+                         "scheme, else the shown hull's linked skin, else the "
+                         "bare ship. 'default': the bare ship.")
+    ap.add_argument("--hull", default="",
+                    help="Hull module whose mounts are placed (a hulls key "
+                         "such as C_Hull, or its upgrade module id). Default: "
+                         "the rendered hull (variants.rendered_hull).")
     ap.add_argument("--exterior", default="",
                     help="Build a mesh-swap exterior from the sidecar's "
                          "exteriors[] (id or display name): variant hull, "
@@ -115,6 +123,8 @@ def _build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--save-blend", type=Path, help="Also save the assembled .blend.")
     ap.add_argument("--list-skins", action="store_true",
                     help="Print the sidecar's skins as JSON and exit.")
+    ap.add_argument("--list-hulls", action="store_true",
+                    help="Print the sidecar's hull modules as JSON and exit.")
     ap.add_argument("--list-exteriors", action="store_true",
                     help="Print the sidecar's exteriors[] as JSON and exit.")
     ap.add_argument("--result-json", type=Path,
@@ -190,8 +200,30 @@ def main() -> int:
         print("WOWS_EXTERIORS_JSON " + json.dumps(payload))
         return EXIT_OK
 
+    if args.list_hulls:
+        from wows_blender.hulls import hull_options
+        from wows_blender.sidecar import load_sidecar
+
+        payload = [
+            {
+                "hull":               h.name,
+                "module_id":          h.module_id,
+                "is_stock":           h.is_stock,
+                "is_active":          h.is_active,
+                "is_rendered":        h.is_rendered,
+                "linked_exterior_id": h.linked_exterior_id,
+                "linked_skin":        h.linked_skin,
+                "main_assets":        list(h.main_assets),
+            }
+            for h in hull_options(load_sidecar(args.sidecar).raw)
+        ]
+        _write_result(args.result_json, {"hulls": payload})
+        print("WOWS_HULLS_JSON " + json.dumps(payload))
+        return EXIT_OK
+
     if args.out is None:
-        print("error: --out is required unless --list-skins/--list-exteriors", file=sys.stderr)
+        print("error: --out is required unless --list-skins/--list-hulls/"
+              "--list-exteriors", file=sys.stderr)
         return EXIT_ARGS
 
     _clear_scene()
@@ -205,6 +237,7 @@ def main() -> int:
             library_root_override=args.library or None,
             skin_id=args.skin,
             exterior_id=args.exterior or None,
+            hull=args.hull or None,
             lod_policy=args.lod,
             damage_variants=args.damage_variants or args.wreck_segments,
             overlays=args.overlays,
@@ -214,7 +247,7 @@ def main() -> int:
             prune_filtered=True,
             on_warning=lambda m: print(f"warn: {m}", file=sys.stderr),
         )
-    except FileNotFoundError as e:
+    except (FileNotFoundError, UnknownHull) as e:
         print(f"error: {e}", file=sys.stderr)
         return EXIT_FAILED
     except Exception as e:  # noqa: BLE001
@@ -368,6 +401,9 @@ def main() -> int:
         "size":     size,
         "manifest": str(manifest_path),
         "skin":     result.skin_id,
+        "skin_source": result.skin_source,
+        "hull":     result.hull,
+        "rendered_hull": result.rendered_hull,
         "exterior": result.exterior_id,
         "mounts_swapped":     result.mounts_swapped,
         "decoratives_placed": result.decoratives_placed,

@@ -164,7 +164,8 @@ def export_fbx(
     out_fbx: Path,
     *,
     blender: str | Path | None = None,
-    skin: str = "default",
+    skin: str = "auto",
+    hull: str | None = None,
     library_root: str | Path | None = None,
     accessories: bool = True,
     materials: bool = True,
@@ -180,7 +181,13 @@ def export_fbx(
     save_blend: Path | None = None,
     timeout: int = 3600,
 ) -> FbxResult:
-    """Assemble ``sidecar``'s ship in Blender and write ``out_fbx``."""
+    """Assemble ``sidecar``'s ship in Blender and write ``out_fbx``.
+
+    ``skin="auto"`` paints the ship as the game shows it (the shown hull's
+    linked skin, else bare); ``"default"`` is the bare ship. ``hull``
+    picks the hull module whose mounts are placed (default: the rendered
+    hull).
+    """
     exe = find_blender(blender)
 
     script_args = [
@@ -196,6 +203,8 @@ def export_fbx(
         "--bake-size", str(bake_size),
         f"--lod={lod}",
     ]
+    if hull:
+        script_args.append(f"--hull={hull}")
     if library_root:
         script_args += ["--library", str(library_root)]
     if not accessories:

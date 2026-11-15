@@ -7,6 +7,10 @@ The add-on reads only what it needs to instantiate a ship:
   / ``accessories[]`` — placements (asset_id + transform.matrix +
   parent_section + attached_y_flip + parent_mesh)
 * ``skins[]`` — optional per-skin material overrides
+* ``exteriors[]`` — mesh-swap exteriors (hull, mounts, decoratives)
+* ``variants.rendered_hull`` + ``hulls.<H>`` — which hull the render doc
+  shows, every hull's mount snapshot and its linked skin
+  (:mod:`wows_blender.hulls`)
 
 This module is pure stdlib (no Pillow, no Blender bpy) so the
 publisher tests can exercise it without spinning up Blender. The
@@ -213,6 +217,12 @@ class Sidecar:
     skins:        tuple[dict[str, Any], ...] = ()
     exteriors:    tuple[Exterior, ...] = ()
     raw:          dict[str, Any] = field(default_factory=dict)
+    #: ``variants.rendered_hull`` (or its fallback): the hull whose mounts
+    #: the render doc holds. None when the sidecar has no ``hulls`` block.
+    rendered_hull: str | None = None
+    #: The hull whose mounts ``placements`` holds: ``rendered_hull`` unless
+    #: :func:`load_ship` was asked for another one.
+    hull:         str | None = None
 
 
 _PLACEMENT_ROLES: tuple[tuple[str, str], ...] = (
@@ -346,7 +356,12 @@ def load_accessories(path: Path) -> tuple[Placement, ...]:
     Mirrors what the webview's `ship.ts` does — flatten + tag with role
     so a single loop can drive instantiation.
     """
-    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    return placements_from_doc(json.loads(Path(path).read_text(encoding="utf-8")))
+
+
+def placements_from_doc(raw: dict[str, Any]) -> tuple[Placement, ...]:
+    """Flatten a parsed accessories-shaped document (the render doc, an
+    exterior's decoratives file, or a render doc after a hull swap)."""
     out: list[Placement] = []
     for key, role in _PLACEMENT_ROLES:
         for entry in raw.get(key) or []:
@@ -439,21 +454,36 @@ def load_decoratives(path: Path) -> tuple[Placement, ...]:
     return load_accessories(path)
 
 
-def load_ship(sidecar_path: Path) -> Sidecar:
+def load_ship(sidecar_path: Path, *, hull: str | None = None) -> Sidecar:
     """Convenience: load sidecar + paired accessories.json in one call.
 
     ``sidecar_path`` points at ``<Ship>.meta.json``; the paired
     accessories file is discovered at
     ``<sidecar_dir>/models/<Ship>_accessories.json``.
+
+    ``hull`` picks the hull module whose mounts ``placements`` holds (a
+    ``hulls`` key, any case, or its upgrade module id). Left out, the
+    placements are the render doc's, which belong to the rendered hull.
+    Another hull swaps the render doc's HP-bound mounts for that hull's
+    sidecar snapshot (:func:`wows_blender.hulls.apply_hull_snapshot`).
+    Raises :class:`wows_blender.hulls.UnknownHull` for a hull the sidecar
+    does not list.
     """
+    from .hulls import apply_hull_snapshot, rendered_hull_name, resolve_hull_name
+
     sidecar_path = Path(sidecar_path)
     sc = load_sidecar(sidecar_path)
+    rendered = rendered_hull_name(sc.raw)
+    shown = resolve_hull_name(sc.raw, hull) if hull else rendered
     ship_dir = sidecar_path.parent
     ship_stem = sidecar_path.name.removesuffix(".meta.json")
     accessories_path = ship_dir / "models" / f"{ship_stem}_accessories.json"
     placements: tuple[Placement, ...] = ()
     if accessories_path.is_file():
-        placements = load_accessories(accessories_path)
+        doc = json.loads(accessories_path.read_text(encoding="utf-8"))
+        if shown is not None and shown != rendered:
+            doc = apply_hull_snapshot(doc, sc.raw, shown)
+        placements = placements_from_doc(doc)
     return Sidecar(
         ship_name=sc.ship_name,
         schema_version=sc.schema_version,
@@ -462,6 +492,8 @@ def load_ship(sidecar_path: Path) -> Sidecar:
         skins=sc.skins,
         exteriors=load_exteriors(sc.raw.get("exteriors")),
         raw=sc.raw,
+        rendered_hull=rendered,
+        hull=shown,
     )
 
 
@@ -575,4 +607,5 @@ __all__ = [
     "load_sidecar",
     "load_accessories",
     "load_ship",
+    "placements_from_doc",
 ]

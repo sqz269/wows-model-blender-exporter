@@ -31,6 +31,10 @@ Argv shape mirrors ``wows-export-unity`` for muscle-memory parity:
         --skin camo_permanent_1__USNP01 --bake
 
     wows-export-blender BA_Montana --list-skins       # what can --skin take?
+
+    # Event ships: another hull module, painted with its linked skin.
+    wows-export-blender Siegfried_1510 --list-hulls   # what can --hull take?
+    wows-export-blender Siegfried_1510 --accessories --fbx --hull C_Hull --bake
 """
 from __future__ import annotations
 
@@ -143,9 +147,26 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     fbx.add_argument(
         "--skin",
-        default="default",
-        help="Camo / permoflage skin_id to apply (default: the bare ship). "
-             "Use --list-skins to see what a ship offers.",
+        default="auto",
+        help="Camo / permoflage skin_id to apply. 'auto' (default) paints "
+             "the ship as the game shows it: the shown hull's linked skin "
+             "(event ships), else the bare ship. 'default' is the bare "
+             "ship. Use --list-skins to see what a ship offers.",
+    )
+    fbx.add_argument(
+        "--hull",
+        default=None,
+        help="Hull module whose mounts are placed: a sidecar hulls key "
+             "(C_Hull) or its upgrade module id. Default: the hull the "
+             "export rendered (variants.rendered_hull). Use --list-hulls "
+             "to see what a ship offers.",
+    )
+    fbx.add_argument(
+        "--list-hulls",
+        action="store_true",
+        help="Print the hull modules of the named ship(s) (rendered / "
+             "active, main guns, linked skin) and exit. Reads the "
+             "sidecar; no export is run.",
     )
     fbx.add_argument(
         "--list-skins",
@@ -331,6 +352,39 @@ def _run_list_skins(args: argparse.Namespace, dest: Path, workspace: Path) -> in
     return rc
 
 
+def _run_list_hulls(args: argparse.Namespace, dest: Path, workspace: Path) -> int:
+    # The hull reader is pure stdlib, so this needs no Blender.
+    from wows_blender.hulls import hull_options
+    from wows_blender.sidecar import load_sidecar
+
+    ships = tuple(args.ships)
+    if not ships:
+        ships = tuple(name for name, _ in _published_ships(dest, None))
+    if not ships:
+        print("no ships named and none published under "
+              f"{dest} — name a ship or publish first", file=sys.stderr)
+        return EXIT_CONFIG_ERROR
+
+    rc = EXIT_OK
+    for ship in ships:
+        sidecar = _sidecar_for(ship, dest, workspace)
+        if sidecar is None:
+            print(f"{ship}: no sidecar found (looked in {dest} and {workspace})",
+                  file=sys.stderr)
+            rc = EXIT_STEP_ERROR
+            continue
+        hulls = hull_options(load_sidecar(sidecar).raw)
+        print(f"\n{ship} — {len(hulls)} hull(s):")
+        for h in hulls:
+            flags = ",".join(f for f, on in (
+                ("rendered", h.is_rendered), ("active", h.is_active),
+                ("stock", h.is_stock)) if on) or "-"
+            mains = "+".join(h.main_assets) or "no main battery"
+            skin = f"  skin {h.linked_skin}" if h.linked_skin else ""
+            print(f"  {h.name:<16} {h.module_id or '':<24} {flags:<22} {mains}{skin}")
+    return rc
+
+
 def _run_fbx(args: argparse.Namespace, dest: Path) -> int:
     from ..blender_runner import BlenderNotFound, export_fbx, find_blender
 
@@ -357,6 +411,7 @@ def _run_fbx(args: argparse.Namespace, dest: Path) -> int:
             out_fbx,
             blender=exe,
             skin=args.skin,
+            hull=args.hull,
             accessories=not args.fbx_no_accessories,
             lod=args.lod,
             damage_variants=args.damage_variants,
@@ -377,8 +432,10 @@ def _run_fbx(args: argparse.Namespace, dest: Path) -> int:
                 extra = (f" — {d.get('meshes_kept', '?')} meshes, "
                          f"{d.get('placed', 0)} placements, "
                          f"{d.get('slots_bound', '?')} texture slots")
+                if d.get("hull"):
+                    extra += f", hull {d['hull']}"
                 if d.get("camo_applied"):
-                    extra += f", camo on {d['camo_applied']} materials"
+                    extra += f", {d.get('skin')} on {d['camo_applied']} materials"
             print(f"    ok — {mb:.1f} MB{extra}", file=sys.stderr)
             for w in result.warnings:
                 print(f"    warn: {w}", file=sys.stderr)
@@ -394,12 +451,14 @@ def _run_fbx(args: argparse.Namespace, dest: Path) -> int:
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
 
-    if args.list_skins:
+    if args.list_skins or args.list_hulls:
         try:
             cfg = resolve_config(args)
         except ConfigError as e:
             print(f"config error: {e}", file=sys.stderr)
             return EXIT_CONFIG_ERROR
+        if args.list_hulls:
+            return _run_list_hulls(args, args.dest, cfg.workspace)
         return _run_list_skins(args, args.dest, cfg.workspace)
 
     domains = _resolve_domains(args)

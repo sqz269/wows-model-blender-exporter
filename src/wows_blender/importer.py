@@ -1,15 +1,18 @@
 """Ship + accessory import operators, and FBX export.
 
-Four Blender Operators:
+Five Blender Operators:
 
 * :class:`WOWS_OT_import_ship` — pick a ``<Ship>.meta.json``, get the
   hull GLB + every accessory placement instantiated at the correct
-  transform with materials wired to PNG textures (and, with a non-default
-  ``skin_id``, the camo overlay on top).
+  transform with materials wired to PNG textures (and, with a skin, the
+  camo overlay on top). ``hull_name`` picks another hull module; by
+  default the ship wears its shown hull's linked skin, if it has one.
 * :class:`WOWS_OT_import_accessory` — pick one ``<asset_id>.glb`` and
   import it standalone (useful for inspecting library assets).
 * :class:`WOWS_OT_list_skins` — report the camo / permoflage skins a
   sidecar offers, so ``skin_id`` can be filled in without leaving Blender.
+* :class:`WOWS_OT_list_hulls` — report the hull modules a sidecar offers
+  (the rendered one, main guns, linked skin), for ``hull_name``.
 * :class:`WOWS_OT_export_fbx` — write the current scene to FBX after
   running the material-prep pass that makes WoWS graphs legible to
   Blender's FBX exporter.
@@ -29,12 +32,14 @@ from bpy.types import Operator
 from bpy_extras.io_utils import ExportHelper, ImportHelper
 
 from .build import (
-    DEFAULT_SKIN_ID,
+    AUTO_SKIN_ID,
     build_ship,
     list_skins,
     reconcile_mirrored_skin_normals,
 )
 from .fbx_prep import PrepCounts, bake_base_color, prep_all_materials, write_material_manifest
+from .hulls import UnknownHull, hull_options
+from .sidecar import load_sidecar
 
 logger = logging.getLogger(__name__)
 
@@ -81,10 +86,21 @@ class WOWS_OT_import_ship(Operator, ImportHelper):
 
     skin_id: StringProperty(
         name="Skin",
-        description="Camo / permoflage skin_id to apply. Leave as 'default' "
-                    "for the bare ship. Use the List Skins button to see what "
-                    "this ship offers.",
-        default=DEFAULT_SKIN_ID,
+        description="Camo / permoflage skin_id to apply. 'auto' paints the "
+                    "ship as the game shows it: the hull's linked skin "
+                    "(event ships), else the bare ship. 'default' is the "
+                    "bare ship. Use the List Skins button to see what this "
+                    "ship offers.",
+        default=AUTO_SKIN_ID,
+    )
+
+    hull_name: StringProperty(
+        name="Hull",
+        description="Hull module whose mounts are placed (C_Hull, or its "
+                    "upgrade module id). Empty: the hull the export "
+                    "rendered. Use the List Hulls button to see what this "
+                    "ship offers.",
+        default="",
     )
 
     lod_policy: StringProperty(
@@ -126,7 +142,8 @@ class WOWS_OT_import_ship(Operator, ImportHelper):
                 import_accessories=self.import_accessories,
                 bind_materials=self.bind_materials,
                 library_root_override=self.library_root_override or None,
-                skin_id=self.skin_id or DEFAULT_SKIN_ID,
+                skin_id=self.skin_id or AUTO_SKIN_ID,
+                hull=self.hull_name.strip() or None,
                 lod_policy=self.lod_policy or "lod0",
                 damage_variants=self.damage_variants,
                 overlays=self.overlays,
@@ -135,7 +152,7 @@ class WOWS_OT_import_ship(Operator, ImportHelper):
                 prune_filtered=False,
                 on_warning=lambda m: self.report({"WARNING"}, m),
             )
-        except FileNotFoundError as e:
+        except (FileNotFoundError, UnknownHull) as e:
             self.report({"ERROR"}, str(e))
             return {"CANCELLED"}
         except Exception as e:  # noqa: BLE001
@@ -200,6 +217,37 @@ class WOWS_OT_list_skins(Operator, ImportHelper):
         self.report(
             {"INFO"},
             f"{len(skins)} skins — see the System Console for the list",
+        )
+        return {"FINISHED"}
+
+
+class WOWS_OT_list_hulls(Operator, ImportHelper):
+    """Report the hull modules a sidecar offers."""
+
+    bl_idname = "wows.list_hulls"
+    bl_label = "List WoWS Hulls"
+    bl_options = {"REGISTER"}
+
+    filename_ext = ".json"
+    filter_glob: StringProperty(default="*.meta.json;*.json", options={"HIDDEN"})
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        try:
+            hulls = hull_options(load_sidecar(Path(self.filepath)).raw)
+        except Exception as e:  # noqa: BLE001
+            self.report({"ERROR"}, f"sidecar parse failed: {e}")
+            return {"CANCELLED"}
+
+        print(f"\n=== {len(hulls)} hull(s) in {Path(self.filepath).name} ===")
+        for h in hulls:
+            mark = "*" if h.is_rendered else " "
+            mains = "+".join(h.main_assets) or "-"
+            skin = f"  skin {h.linked_skin}" if h.linked_skin else ""
+            print(f" {mark} {h.name:<16} {h.module_id or '':<24} {mains}{skin}")
+        print("   (* = the rendered hull, built when Hull is left empty)")
+        self.report(
+            {"INFO"},
+            f"{len(hulls)} hulls — see the System Console for the list",
         )
         return {"FINISHED"}
 
@@ -314,6 +362,7 @@ classes = (
     WOWS_OT_import_ship,
     WOWS_OT_import_accessory,
     WOWS_OT_list_skins,
+    WOWS_OT_list_hulls,
     WOWS_OT_export_fbx,
 )
 
@@ -332,6 +381,7 @@ __all__ = [
     "WOWS_OT_import_ship",
     "WOWS_OT_import_accessory",
     "WOWS_OT_list_skins",
+    "WOWS_OT_list_hulls",
     "WOWS_OT_export_fbx",
     "register",
     "unregister",
