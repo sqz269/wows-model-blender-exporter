@@ -1088,7 +1088,10 @@ def build_ship(
                 misc_filters = _misc_filter_from_sidecar(sidecar.raw)
                 if off_render_hull and sidecar.hull:
                     # The top-level filters describe the rendered hull's
-                    # components; the shown hull's own snapshot wins.
+                    # components; the shown hull's own snapshot wins (spec
+                    # §11.2). On a mesh-swap variant sidecar the top level
+                    # holds the variant's asset + whitelist; the snapshot
+                    # replaced both, so the pair stays consistent.
                     misc_filters.update(hull_misc_filters(sidecar.raw, sidecar.hull))
                 stats = _import_accessory_placements(
                     sidecar.placements, library, library_root, root,

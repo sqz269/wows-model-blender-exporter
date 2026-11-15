@@ -9,7 +9,9 @@ Producer schema: `wows-model-export` `reference/schemas/METADATA_SPEC.md`
 §11.1 (`variants.rendered_hull`) and §11.2 (`hulls` block, "Hull-linked
 skins"). Reference consumer: the webview's Hulls tab
 (`webview/src/lib/ship/viewer.ts`: `defaultHullName`, `applyHullSnapshot`,
-the hull-linked skin step of `loadShip`).
+the hull-linked skin step of `loadShip`), except for `misc_filter`
+(below). Consumer rules and open issues: `wows-model-export`
+`reference/consumers/hull_modules.md`.
 
 ## What the sidecar carries
 
@@ -36,7 +38,8 @@ equal the top-level ones as `(section, hp_name, asset_id)` sets (spec
 Over the build 13533378 workspace this fallback names the stored
 `rendered_hull` on all 56 sidecars that carry one.
 
-Another hull is built like this (webview `applyHullSnapshot`):
+Another hull's mounts are built as the webview's `applyHullSnapshot`
+builds them; their attachment filters follow spec §11.2:
 
 - The typed mount sections (turrets, secondaries, AA, torpedoes) are
   replaced by the hull's snapshot.
@@ -45,8 +48,19 @@ Another hull is built like this (webview `applyHullSnapshot`):
 - A render-doc entry for the same instance, hardpoint and asset keeps the
   fields the snapshot lacks (`dead_asset_id`, `source`), with the
   snapshot's values on top.
-- Each mount's attachments follow the shown hull's own `misc_filter`;
-  the top-level values belong to the rendered hull.
+- Each mount's attachments follow the shown hull's own `misc_filter`:
+  where a snapshot entry carries the key, it replaces the top-level value,
+  which belongs to the rendered hull (`hulls.hull_misc_filters`). The
+  webview differs here: its lookup takes the top-level value first, so its
+  Hulls tab keeps the rendered hull's filters (an open webview issue; 10
+  workspace sidecars differ, e.g. Cleveland `--hull B_Hull` places the
+  Mk37 director's radars, which the webview drops).
+- A mesh-swap variant sidecar (`Azur_Hindenburg`, `Azur_Massachusetts`,
+  ...) carries the variant's swapped `asset_id` and its `nodesConfig`
+  whitelist at the top level; the snapshots keep the ship's own (spec
+  §11.2). Another hull takes both from its snapshot, so asset and
+  whitelist stay a pair, and the variant swap does not carry over. Every
+  such sidecar in the build 13533378 workspace has one hull.
 - The hull mesh does not change: the producer exports the model of the
   lowest upgrade id only (spec §11.2 "Rendered hull").
 

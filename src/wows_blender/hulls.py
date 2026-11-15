@@ -19,8 +19,10 @@ Obsession's bot tile). The game shows that skin whenever the hull is
 the selected one, so a build that is not told which skin to paint
 paints the shown hull's linked skin. Every other skin stays selectable.
 
-Webview parity: ``webview/src/lib/ship/viewer.ts`` (``defaultHullName``,
-``applyHullSnapshot`` and the hull-linked skin step of ``loadShip``).
+Mounts and skin as the webview builds them: ``webview/src/lib/ship/viewer.ts``
+(``defaultHullName``, ``applyHullSnapshot`` and the hull-linked skin step
+of ``loadShip``). ``misc_filter`` follows METADATA_SPEC.md §11.2 instead
+(the shown hull's snapshot wins); the webview keeps the top-level filters.
 """
 from __future__ import annotations
 

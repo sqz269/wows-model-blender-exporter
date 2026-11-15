@@ -12,8 +12,10 @@ Design notes and reference material for the Blender consumer.
 ## Where the producer schema lives
 
 The authoritative pipeline schema lives in the producer repo:
-`wows-model-export/reference/contracts/` — `METADATA_SPEC.md`,
-`example.meta.json`, `turret_rig_spec.md`, `damage_state_semantics.md`.
+`wows-model-export/reference/schemas/` — `METADATA_SPEC.md`,
+`example.meta.json`, `turret_rig_spec.md`. Consumer notes such as
+`damage_state_semantics.md` and `hull_modules.md` sit in
+`wows-model-export/reference/consumers/`.
 This consumer reads a subset of that schema (materials,
 turrets/secondaries/antiair/torpedoes/accessories placements, skins,
 exteriors, `variants.rendered_hull` and the `hulls` block).
